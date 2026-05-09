@@ -20,7 +20,14 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatType, ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
-from aiogram.types import BotCommand, FSInputFile, Message
+from aiogram.types import (
+    BotCommand,
+    BotCommandScopeAllGroupChats,
+    BotCommandScopeAllPrivateChats,
+    BotCommandScopeDefault,
+    FSInputFile,
+    Message,
+)
 
 from .base import IncomingMessage, OnMessageHandler
 
@@ -101,16 +108,23 @@ class TelegramAdapter:
         if self._bot is None:
             log.warning("telegram set_menu called before bot was started")
             return
-        # Telegram requires names matching ^[a-z0-9_]{1,32}$ — already
-        # enforced by the menu list shape; underscores stay underscores in
-        # the API call, but users will type the more familiar /security-review
-        # form too (handled in commands.parse).
         bot_cmds = [BotCommand(command=name, description=desc) for name, desc in commands]
-        try:
-            await self._bot.set_my_commands(bot_cmds)
-            log.info("telegram: registered %d menu commands", len(bot_cmds))
-        except Exception:  # noqa: BLE001
-            log.exception("telegram: set_my_commands failed (non-fatal)")
+        # Telegram applies the most-specific scope first, so we have to
+        # overwrite *every* broad scope — otherwise stale commands left by
+        # an earlier bot owner (e.g. the official channel plugin) keep
+        # showing up in DMs even though setMyCommands(default) succeeded.
+        scopes = [
+            ("default", BotCommandScopeDefault()),
+            ("all_private_chats", BotCommandScopeAllPrivateChats()),
+            ("all_group_chats", BotCommandScopeAllGroupChats()),
+        ]
+        for label, scope in scopes:
+            try:
+                await self._bot.set_my_commands(bot_cmds, scope=scope)
+                log.info("telegram: registered %d menu commands (scope=%s)",
+                         len(bot_cmds), label)
+            except Exception:  # noqa: BLE001
+                log.exception("telegram: set_my_commands(scope=%s) failed", label)
 
     async def send_message(
         self, chat_id: str, text: str, *, reply_to: str | None = None
