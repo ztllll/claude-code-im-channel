@@ -45,6 +45,7 @@ from .commands import (
     CancelRegistry,
     dispatch as dispatch_command,
     parse as parse_command,
+    rewrite_for_claude,
 )
 from .config import Config
 from .session_store import SessionStore
@@ -318,11 +319,14 @@ def _process_message(
             return
 
     # Step 2: build prompt and run claude.
-    prompt = msg.text
+    # Rewrite menu underscore commands back to claude's hyphenated form
+    # (e.g. /security_review → /security-review) so claude's slash-command
+    # / skill layer recognises them.
+    prompt = rewrite_for_claude(msg.text)
     if msg.attachments:
         attach_lines = "\n".join(f"- file: {p}" for p in msg.attachments)
         prompt = (
-            (msg.text + "\n\n" if msg.text else "")
+            (prompt + "\n\n" if prompt else "")
             + "[user attached the following file(s); use Read tool to inspect them if useful]\n"
             + attach_lines
         )

@@ -74,23 +74,151 @@ class CommandResult:
     text: str
 
 
-# Order matters — this is also the display order in the Telegram menu.
+# Telegram requires command names match ^[a-z0-9_]{1,32}$, so commands that
+# claude knows by a hyphenated name are written here with underscores and
+# rewritten on the way out (see ``rewrite_for_claude``).
+#
+# Order = display order in the menu. Daemon-handled (intercepted) ones go
+# first because they actually work in this mode; then pass-through skills
+# that produce useful output; then TUI-only commands marked [TUI] so the
+# user knows they only get a text echo.
 MENU: list[tuple[str, str]] = [
+    # —— daemon 控制（拦截，绝对能用） ——
     ("new", "开新对话（清空当前 chat 的 session）"),
-    ("cancel", "取消当前 chat 正在运行的 claude turn"),
-    ("status", "查看 daemon 与会话状态"),
+    ("cancel", "取消当前 chat 正在跑的 claude turn"),
+    ("status", "查看 daemon 与本 chat 的会话状态"),
     ("sessions", "列出所有 chat 的活动 session"),
     ("log", "显示 daemon 最近 30 行日志"),
     ("help", "列出可用命令"),
-    ("review", "审查当前分支（claude /review）"),
-    ("init", "为当前仓库生成 CLAUDE.md（claude /init）"),
-    ("security_review", "安全审查（claude /security-review）"),
-    ("simplify", "代码复用与质量审查（claude /simplify）"),
-    ("ultrareview", "多 agent 云端审查（claude /ultrareview）"),
+
+    # —— skill 透传（远程能用，会真的产生输出） ——
+    ("review", "审查当前分支或 PR"),
+    ("security_review", "安全审查（扫漏洞）"),
+    ("simplify", "代码复用与质量审查"),
+    ("ultrareview", "多 agent 云端审查（云端跑 + 计费）"),
+    ("init", "为当前仓库生成 CLAUDE.md"),
+    ("autofix_pr", "自动修复当前 PR 的 CI 问题"),
+    ("recap", "一句话总结当前会话进展"),
+    ("doctor", "诊断 claude 安装与凭证状态"),
+    ("release_notes", "查看 claude 最新版本变更"),
+    ("btw", "不打断主线，顺手问一个题外话"),
+    ("branch", "从当前对话分一个旁支问题"),
+    ("advisor", "让更强模型在关键节点给建议"),
+    ("memory", "查看/编辑 claude 长期 memory 文件"),
+    ("plan", "进入 plan 模式或查看当前 session 计划"),
+    ("todo", "查看/操作当前 session 待办"),
+    ("claude_api", "Anthropic SDK 编码 / 模型迁移助手"),
+    ("update_config", "改 .claude/settings.json（权限/钩子/环境）"),
+    ("fewer_permission_prompts", "扫历史把常用命令加进 allowlist"),
+    ("keybindings_help", "自定义 ~/.claude/keybindings.json"),
+    ("agent_reach", "配置 Twitter/Reddit/YouTube/GitHub 等平台访问"),
+
+    # —— 当前 session 状态调整（TUI 限定，远程基本只能拿到文字解释） ——
+    ("clear", "[TUI] 清空当前 session 上下文（-p 没意义）"),
+    ("compact", "[TUI] 压缩当前对话省 token"),
+    ("context", "[TUI] 可视化上下文使用网格"),
+    ("focus", "[TUI] 切换 focus 视图"),
+    ("color", "[TUI] 改 prompt bar 颜色"),
+    ("effort", "[TUI] 切 effort 级别（low/medium/high/xhigh/max）"),
+    ("fast", "[TUI] 切 fast 模式（仅 Opus 4.6）"),
+    ("model", "[TUI] 切模型（sonnet/opus 等）"),
+    ("agents", "[TUI] 管理 agent 配置"),
+    ("add_dir", "[TUI] 给当前 session 加工作目录"),
+    ("copy", "[TUI] 复制最近回复到剪贴板"),
+    ("diff", "[TUI] 查看每轮代码差异"),
+
+    # —— 设置面板（TUI 限定，远程只能问"这是什么"） ——
+    ("config", "[TUI] 打开 config 面板"),
+    ("permissions", "[TUI] 管理工具权限规则"),
+    ("keybindings", "[TUI] 编辑快捷键配置"),
+    ("privacy_settings", "[TUI] 隐私设置"),
+    ("extra_usage", "[TUI] 配置额度耗尽处理"),
+    ("hooks", "[TUI] 查看 hook 配置"),
+
+    # —— 插件 / MCP / IDE ——
+    ("mcp", "[TUI] 管理 MCP 服务"),
+    ("plugin", "[TUI] 管理 plugin"),
+    ("reload_plugins", "重新加载当前 session 的 plugin"),
+    ("ide", "[TUI] 管理 IDE 集成"),
+    ("install_github_app", "[慎用] 为仓库装 Claude GitHub Actions"),
+    ("install_slack_app", "[慎用] 为账号装 Claude Slack app"),
+
+    # —— 账户 / 设备 ——
+    ("login", "[慎用] 登录 Anthropic 账号（远程操作会冲掉当前凭证）"),
+    ("logout", "[慎用] 登出（会破坏 daemon 持续运行）"),
+    ("passes", "邀请朋友领免费一周 Claude Code"),
+    ("mobile", "[TUI] 显示 Claude mobile app 二维码"),
+    ("powerup", "通过教程快速上手 Claude 功能"),
+    ("radio", "[TUI] 听 Claude FM lo-fi 电台"),
+    ("chrome", "[beta] Claude in Chrome 设置"),
+    ("feedback", "给 Claude Code 团队提反馈"),
+
+    # —— 会话操作 ——
+    ("export", "导出当前对话到文件或剪贴板"),
+    ("rename", "重命名当前对话"),
+    ("resume", "[TUI] 旧会话恢复挑选器（注意：本菜单 /new 才是重置当前 chat）"),
+    ("exit", "[TUI] 退出 CLI（在 daemon 里无意义）"),
+
+    # —— 远程控制 / 调度 ——
+    ("remote_control", "启用 remote control 连接"),
+    ("remote_env", "配置 remote env（teleport sessions）"),
+    ("loop", "[受限] 安排周期任务（daemon 一次性 turn 模型可能不完整支持）"),
+    ("schedule", "安排远程定时 agent（routine）"),
+
+    # —— hyperframes 视频 / 动画相关 skill ——
+    ("hyperframes", "HyperFrames HTML 视频合成"),
+    ("hyperframes_media", "HyperFrames TTS / 转写 / 抠图预处理"),
+    ("hyperframes_cli", "HyperFrames CLI 工具集"),
 ]
 
 # Daemon intercepts these — everything else is forwarded to claude.
 _DAEMON_HANDLED = {"new", "cancel", "status", "sessions", "log", "help"}
+
+# Some commands claude knows by a hyphenated name; menu entries use
+# underscores (telegram requirement) and we rewrite on the way out so
+# claude's slash-command layer recognises them.
+_HYPHEN_FORMS: dict[str, str] = {
+    "security_review": "security-review",
+    "release_notes": "release-notes",
+    "autofix_pr": "autofix-pr",
+    "install_github_app": "install-github-app",
+    "install_slack_app": "install-slack-app",
+    "remote_control": "remote-control",
+    "remote_env": "remote-env",
+    "privacy_settings": "privacy-settings",
+    "extra_usage": "extra-usage",
+    "fewer_permission_prompts": "fewer-permission-prompts",
+    "update_config": "update-config",
+    "keybindings_help": "keybindings-help",
+    "claude_api": "claude-api",
+    "agent_reach": "agent-reach",
+    "add_dir": "add-dir",
+    "hyperframes_media": "hyperframes-media",
+    "hyperframes_cli": "hyperframes-cli",
+}
+
+
+def rewrite_for_claude(text: str) -> str:
+    """Rewrite a leading ``/snake_case`` command to the form claude expects.
+
+    The menu must use underscores (telegram constraint) but several built-in
+    claude commands and skills are registered under their hyphenated form.
+    We rewrite the leading token only — everything after the first space
+    (typed args) is preserved verbatim.
+    """
+    if not text or not text.startswith("/"):
+        return text
+    head, sep, rest = text.partition(" ")
+    name = head[1:]
+    bot_at = ""
+    if "@" in name:
+        name, _, bot_at = name.partition("@")
+        bot_at = "@" + bot_at
+    canonical = name.lower()
+    hyphen = _HYPHEN_FORMS.get(canonical)
+    if hyphen is None:
+        return text
+    return "/" + hyphen + bot_at + (sep + rest if sep else "")
 
 
 def _read_tail(path: Path, max_lines: int) -> str:
