@@ -27,6 +27,7 @@ responsive because every UI call is scheduled back onto it via
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import os
 import re
@@ -485,8 +486,14 @@ class Daemon:
                 # without exceptions surfacing as crashes — so wrap in shield.
                 fut = loop.run_in_executor(
                     self.executor,
-                    _process_message,
-                    msg, self.cfg, self.sessions, adapter, loop,
+                    functools.partial(
+                        _process_message,
+                        msg=msg,
+                        cfg=self.cfg,
+                        sessions=self.sessions,
+                        adapter=adapter,
+                        loop=loop,
+                    ),
                 )
                 try:
                     await fut
