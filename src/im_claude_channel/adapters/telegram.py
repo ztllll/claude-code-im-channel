@@ -20,7 +20,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatType, ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
-from aiogram.types import FSInputFile, Message
+from aiogram.types import BotCommand, FSInputFile, Message
 
 from .base import IncomingMessage, OnMessageHandler
 
@@ -30,10 +30,17 @@ log = logging.getLogger(__name__)
 class TelegramAdapter:
     platform = "telegram"
 
-    def __init__(self, bot_token: str, *, inbound_dir: str) -> None:
+    def __init__(
+        self,
+        bot_token: str,
+        *,
+        inbound_dir: str,
+        menu: list[tuple[str, str]] | None = None,
+    ) -> None:
         self._token = bot_token
         self._inbound_dir = Path(inbound_dir).expanduser()
         self._inbound_dir.mkdir(parents=True, exist_ok=True)
+        self._menu = menu or []
         self._bot: Bot | None = None
         self._dp: Dispatcher | None = None
         self._bot_id: int | None = None
@@ -52,6 +59,9 @@ class TelegramAdapter:
         self._bot_id = me.id
         self._bot_username = me.username
         log.info("telegram adapter ready as @%s (id=%s)", self._bot_username, self._bot_id)
+
+        if self._menu:
+            await self.set_menu(self._menu)
 
         @self._dp.message()
         async def _handle(msg: Message) -> None:
@@ -86,6 +96,21 @@ class TelegramAdapter:
             await self._dp.stop_polling()
         if self._bot is not None:
             await self._bot.session.close()
+
+    async def set_menu(self, commands: list[tuple[str, str]]) -> None:
+        if self._bot is None:
+            log.warning("telegram set_menu called before bot was started")
+            return
+        # Telegram requires names matching ^[a-z0-9_]{1,32}$ — already
+        # enforced by the menu list shape; underscores stay underscores in
+        # the API call, but users will type the more familiar /security-review
+        # form too (handled in commands.parse).
+        bot_cmds = [BotCommand(command=name, description=desc) for name, desc in commands]
+        try:
+            await self._bot.set_my_commands(bot_cmds)
+            log.info("telegram: registered %d menu commands", len(bot_cmds))
+        except Exception:  # noqa: BLE001
+            log.exception("telegram: set_my_commands failed (non-fatal)")
 
     async def send_message(
         self, chat_id: str, text: str, *, reply_to: str | None = None

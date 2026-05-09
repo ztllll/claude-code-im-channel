@@ -40,6 +40,7 @@ from typing import TYPE_CHECKING
 
 from .access import AccessControl
 from .claude_runner import ClaudeRunError, run_stream as claude_run_stream
+from .commands import MENU as COMMAND_MENU, dispatch as dispatch_command, parse as parse_command
 from .config import Config
 from .session_store import SessionStore
 
@@ -410,6 +411,7 @@ class Daemon:
         self._chat_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self._access: dict[str, AccessControl] = {}
         self._adapters: list = []
+        self._started_at = time.monotonic()
 
     def _chat_lock(self, platform: str, chat_id: str) -> asyncio.Lock:
         key = (platform, chat_id)
@@ -424,7 +426,11 @@ class Daemon:
         inbound_dir = os.path.join(self.cfg.session.state_dir, "inbound")
         if self.cfg.telegram.enabled:
             from .adapters.telegram import TelegramAdapter
-            tg = TelegramAdapter(self.cfg.telegram.bot_token, inbound_dir=inbound_dir)
+            tg = TelegramAdapter(
+                self.cfg.telegram.bot_token,
+                inbound_dir=inbound_dir,
+                menu=COMMAND_MENU,
+            )
             self._access["telegram"] = AccessControl(
                 self.cfg.telegram.allowed_user_ids,
                 self.cfg.telegram.group_only_when_mentioned,
@@ -469,15 +475,39 @@ class Daemon:
             len(msg.text), len(msg.attachments),
         )
 
-        # 3) per-chat serialisation + offload to worker
-        loop = asyncio.get_running_loop()
-        lock = self._chat_lock(msg.platform, msg.chat_id)
-
-        # Find the adapter for this platform.
+        # 3) slash-command interception — daemon-handled commands skip claude.
         adapter = next((a for a in self._adapters if a.platform == msg.platform), None)
         if adapter is None:
             log.error("no adapter for platform %s", msg.platform)
             return
+
+        parsed = parse_command(msg.text)
+        if parsed is not None:
+            name, _args = parsed
+            result = dispatch_command(
+                name,
+                sessions=self.sessions,
+                platform=msg.platform,
+                chat_id=msg.chat_id,
+                daemon_started_at=self._started_at,
+            )
+            if result is not None:
+                log.info("command: %s/%s ran /%s (daemon-handled)",
+                         msg.platform, msg.chat_id, name)
+                try:
+                    await adapter.send_message(
+                        msg.chat_id, result.text, reply_to=msg.message_id
+                    )
+                except Exception:  # noqa: BLE001
+                    log.exception("command: failed to deliver reply for /%s", name)
+                return
+            # Not daemon-handled → fall through; claude will see the slash
+            # command as the prompt and route it through its own skill layer.
+            log.info("command: /%s passed through to claude", name)
+
+        # 4) per-chat serialisation + offload to worker
+        loop = asyncio.get_running_loop()
+        lock = self._chat_lock(msg.platform, msg.chat_id)
 
         async def _runner():
             async with lock:

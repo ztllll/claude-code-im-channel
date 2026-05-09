@@ -58,3 +58,12 @@ class Adapter(Protocol):
 
     async def send_file(self, chat_id: str, file_path: str, *, caption: str = "") -> str:
         ...
+
+    async def set_menu(self, commands: list[tuple[str, str]]) -> None:
+        """Register the command menu shown in the platform's chat UI.
+
+        ``commands`` is a list of ``(name, description)`` tuples. Adapter
+        translates to its native API (Telegram setMyCommands, etc).
+        Best-effort: failures must not abort startup.
+        """
+        ...
