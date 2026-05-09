@@ -122,6 +122,7 @@ def run_stream(
     *,
     resume_session_id: str | None = None,
     on_event: Callable[[dict], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> ClaudeResult:
     """Run claude in stream-json mode and pipe events to ``on_event``.
 
@@ -136,6 +137,9 @@ def run_stream(
     A synthetic ``{"type": "heartbeat", ...}`` event is injected every 5s of
     stdout silence so the UI can keep refreshing the elapsed counter without
     touching the idle timer.
+
+    ``cancel_check`` is polled on every loop iteration; returning True kills
+    the subprocess and raises ClaudeRunError("cancelled"). Used by ``/cancel``.
     """
     cmd: list[str] = [cfg.binary, "-p", "--output-format", "stream-json", "--verbose"]
     cmd.extend(cfg.extra_args)
@@ -205,6 +209,9 @@ def run_stream(
                     f"claude CLI idle for {idle_seconds}s "
                     f"(no events from upstream — likely stuck network)"
                 )
+            if cancel_check is not None and cancel_check():
+                proc.kill()
+                raise ClaudeRunError("cancelled by /cancel")
 
             # Wake at whichever boundary comes first: next heartbeat tick,
             # idle deadline, or total deadline. Cap at 5s so we always re-check.

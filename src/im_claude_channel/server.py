@@ -40,7 +40,12 @@ from typing import TYPE_CHECKING
 
 from .access import AccessControl
 from .claude_runner import ClaudeRunError, run_stream as claude_run_stream
-from .commands import MENU as COMMAND_MENU, dispatch as dispatch_command, parse as parse_command
+from .commands import (
+    MENU as COMMAND_MENU,
+    CancelRegistry,
+    dispatch as dispatch_command,
+    parse as parse_command,
+)
 from .config import Config
 from .session_store import SessionStore
 
@@ -187,6 +192,7 @@ def _process_message(
     sessions: SessionStore,
     adapter,               # Adapter
     loop: asyncio.AbstractEventLoop,
+    cancels: CancelRegistry,
 ) -> None:
     """Worker body — runs in a thread. Pushes UI updates back to the asyncio loop."""
 
@@ -322,6 +328,7 @@ def _process_message(
         )
     full_prompt = prompt + _BRIDGE_HINT_OUTBOUND_FILES
 
+    cancel_event = cancels.arm(platform, chat_id)
     try:
         resume = sessions.get(platform, chat_id)
         log.info(
@@ -333,6 +340,7 @@ def _process_message(
             cfg.claude,
             resume_session_id=resume,
             on_event=on_event,
+            cancel_check=cancel_event.is_set,
         )
         if result.session_id:
             sessions.upsert(platform, chat_id, result.session_id)
@@ -349,6 +357,8 @@ def _process_message(
     except Exception as e:  # noqa: BLE001
         reply = f"⚠️ 桥接出错：{type(e).__name__}: {e}"
         log.exception("worker: unexpected error")
+    finally:
+        cancels.disarm(platform, chat_id)
 
     # Step 3: deliver text part (with [ATTACH:] markers stripped) + files.
     text_part, attachments = _extract_attachments_from_reply(reply)
@@ -412,6 +422,7 @@ class Daemon:
         self._access: dict[str, AccessControl] = {}
         self._adapters: list = []
         self._started_at = time.monotonic()
+        self.cancels = CancelRegistry()
 
     def _chat_lock(self, platform: str, chat_id: str) -> asyncio.Lock:
         key = (platform, chat_id)
@@ -490,6 +501,8 @@ class Daemon:
                 platform=msg.platform,
                 chat_id=msg.chat_id,
                 daemon_started_at=self._started_at,
+                cancel_registry=self.cancels,
+                log_file=self.cfg.logging.file,
             )
             if result is not None:
                 log.info("command: %s/%s ran /%s (daemon-handled)",
@@ -523,6 +536,7 @@ class Daemon:
                         sessions=self.sessions,
                         adapter=adapter,
                         loop=loop,
+                        cancels=self.cancels,
                     ),
                 )
                 try:
