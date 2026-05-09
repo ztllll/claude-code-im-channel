@@ -1,0 +1,53 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "im-claude-channel"
+version = "0.1.0"
+description = "Telegram + Discord channel daemon for Claude Code — bridge IM messages to claude CLI sessions on remote servers, with auto-restart and stream-json progress."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+authors = [
+    { name = "ztllll", email = "11680661@qq.com" },
+]
+keywords = ["telegram", "discord", "claude", "claude-code", "channel", "bot"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Communications :: Chat",
+]
+
+dependencies = [
+    "aiogram>=3.4",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+discord = ["discord.py>=2.3"]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.6",
+]
+
+[project.scripts]
+im-claude-channel = "im_claude_channel.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/ztllll/claude-code-im-channel"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/im_claude_channel"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "RUF"]
+ignore = ["E501"]

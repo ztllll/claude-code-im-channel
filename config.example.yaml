@@ -1,0 +1,39 @@
+# im-claude-channel — daemon config.
+# Copy to config.yaml and fill in. Real config.yaml is gitignored.
+
+telegram:
+  enabled: true
+  bot_token: ""           # also overridable via env: TELEGRAM_BOT_TOKEN
+  # Telegram numeric user_ids that may invoke claude. Leave empty to allow
+  # everyone (only safe if the bot is invite-only at the platform level).
+  allowed_user_ids:
+    - "8570415194"
+  group_only_when_mentioned: true
+
+discord:
+  enabled: false          # flip on once telegram is verified stable
+  bot_token: ""           # env: DISCORD_BOT_TOKEN
+  allowed_user_ids: []
+  group_only_when_mentioned: true
+
+claude:
+  binary: claude
+  # Where claude runs. CRITICAL: claude indexes sessions per project (cwd),
+  # so to inherit sessions from an existing tmux'd `claude --channels ...`
+  # you must set this to whatever cwd that tmux was using. For "claude
+  # launched from /" the value is "/". Sessions then land in
+  # ~/.claude/projects/-/ on disk and `--resume <id>` finds them.
+  work_dir: "/"
+  # Extra flags appended to `claude -p`. Use to pin model, skip permissions, etc.
+  extra_args:
+    - "--dangerously-skip-permissions"
+  timeout_seconds: 7200       # hard ceiling per turn
+  idle_timeout_seconds: 900   # kill subprocess if no events for this long
+
+session:
+  state_dir: ~/.im-claude-channel
+  archive_after_days: 14
+
+logging:
+  file: ~/.im-claude-channel/daemon.log
+  level: INFO

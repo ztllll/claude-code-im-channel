@@ -1,0 +1,542 @@
+"""Daemon main: bot adapters + per-message claude workers + progress card.
+
+Inbound flow:
+
+    bot adapter (asyncio)
+      → on_message(IncomingMessage)
+      → access check
+      → per-(platform, chat_id) lock (so two fast messages serialise instead
+        of racing for session_id)
+      → ThreadPoolExecutor.submit(_process)
+            ↓ (worker thread)
+        claude_runner.run_stream(prompt, resume_session_id, on_event=...)
+            ↓ (each event)
+        on_event(ev) → asyncio.run_coroutine_threadsafe(
+                          adapter.edit_message(progress card),
+                          loop)   # fire-and-forget
+            ↓ (final result)
+        deliver final reply via adapter.edit_message + send_message for
+        chunked / overflow text and adapter.send_file for [ATTACH:] markers
+        sessions.upsert(platform, chat_id, new_session_id)
+
+The worker thread blocks on the claude subprocess; the asyncio loop stays
+responsive because every UI call is scheduled back onto it via
+``run_coroutine_threadsafe``. We never await blocking calls on the loop itself.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import re
+import threading
+import time
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from .access import AccessControl
+from .claude_runner import ClaudeRunError, run_stream as claude_run_stream
+from .config import Config
+from .session_store import SessionStore
+
+if TYPE_CHECKING:
+    from .adapters.base import Adapter, IncomingMessage
+
+log = logging.getLogger(__name__)
+
+
+def _hydrate_claude_env(env_path: str = "~/.claude/.env") -> None:
+    """Pull ANTHROPIC_* vars from ~/.claude/.env if not already set.
+
+    The claude CLI on a typical install reads env from ~/.claude/.env via a
+    bashrc shim. When we spawn it from a daemon (no bashrc), we wire those
+    vars in ourselves so sub2api endpoints / API tokens are honored.
+    """
+    p = Path(env_path).expanduser()
+    if not p.is_file():
+        return
+    for line in p.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key = key.strip().lstrip("export").strip()
+        val = val.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = val
+
+
+# ---------------------------------------------------------------------------
+# Constants & helpers
+# ---------------------------------------------------------------------------
+
+
+# Telegram caps message text at 4096 chars; Discord at 2000. Pick the smaller
+# common ceiling so a single chunker works for both.
+_TEXT_MAX = 1900
+_THINKING_PLACEHOLDER = "🤔 *正在思考…*"
+
+# Edits during a tool-heavy turn would burn the bot's API quota; throttle.
+_CARD_EDIT_MIN_INTERVAL = 1.5
+_PROGRESS_PREVIEW_MAX = 280
+
+_ATTACH_RE = re.compile(r"\[ATTACH:\s*([^\]\s][^\]]*)\]")
+_BRIDGE_HINT_OUTBOUND_FILES = (
+    "\n\n[bridge note] To send a file or image back to the user, write "
+    "[ATTACH:/abs/path] anywhere in your reply. The bridge will strip the "
+    "marker and send the file as a separate message; the rest of your text "
+    "is delivered normally.\n"
+)
+
+
+def _chunk(text: str, max_chars: int = _TEXT_MAX) -> list[str]:
+    """Split a long reply on paragraph boundaries first, char boundaries as fallback."""
+    if len(text) <= max_chars:
+        return [text]
+    chunks: list[str] = []
+    cur: list[str] = []
+    cur_len = 0
+    for para in text.split("\n"):
+        while len(para) > max_chars:
+            chunks.append(para[:max_chars])
+            para = para[max_chars:]
+        added = len(para) + (1 if cur else 0)
+        if cur_len + added > max_chars and cur:
+            chunks.append("\n".join(cur))
+            cur, cur_len = [para], len(para)
+        else:
+            cur.append(para)
+            cur_len += added
+    if cur:
+        chunks.append("\n".join(cur))
+    return chunks
+
+
+def _extract_attachments_from_reply(text: str) -> tuple[str, list[str]]:
+    paths: list[str] = []
+    for m in _ATTACH_RE.finditer(text):
+        p = m.group(1).strip()
+        if Path(p).is_file():
+            paths.append(p)
+        else:
+            log.warning("[ATTACH] target does not exist: %s", p)
+    cleaned = _ATTACH_RE.sub("", text).strip()
+    return cleaned, paths
+
+
+class _SeenEventCache:
+    """Tiny thread-safe LRU keyed by (platform, message_id).
+
+    Telegram redelivers updates if our long-poll loop crashes mid-handle
+    without ACKing; Discord shouldn't but bugs happen. Either way, dedupe.
+    """
+
+    def __init__(self, maxsize: int = 1024) -> None:
+        self._d: OrderedDict[str, None] = OrderedDict()
+        self._max = maxsize
+        self._lock = threading.Lock()
+
+    def check_and_add(self, key: str) -> bool:
+        if not key:
+            return False
+        with self._lock:
+            if key in self._d:
+                self._d.move_to_end(key)
+                return True
+            self._d[key] = None
+            if len(self._d) > self._max:
+                self._d.popitem(last=False)
+            return False
+
+
+def _summarise_tool(name: str, inp: dict) -> str:
+    if not isinstance(inp, dict):
+        return ""
+    if name == "Bash":
+        return (inp.get("command") or "")[:80]
+    if name in ("Read", "Edit", "Write", "NotebookEdit"):
+        return inp.get("file_path") or inp.get("notebook_path") or ""
+    if name in ("Grep", "Glob"):
+        return inp.get("pattern", "")
+    if name == "WebFetch":
+        return inp.get("url", "")
+    if name == "WebSearch":
+        return inp.get("query", "")
+    if name == "TodoWrite":
+        todos = inp.get("todos") or []
+        return f"{len(todos)} 项 todo"
+    if name in ("Task", "Agent"):
+        return (inp.get("description") or "")[:80]
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# Worker (sync, runs in ThreadPoolExecutor)
+# ---------------------------------------------------------------------------
+
+
+def _process_message(
+    *,
+    msg,                   # IncomingMessage
+    cfg: Config,
+    sessions: SessionStore,
+    adapter,               # Adapter
+    loop: asyncio.AbstractEventLoop,
+) -> None:
+    """Worker body — runs in a thread. Pushes UI updates back to the asyncio loop."""
+
+    chat_id = msg.chat_id
+    platform = msg.platform
+
+    # Helper to schedule an async adapter call from this thread.
+    def _run_async(coro):
+        return asyncio.run_coroutine_threadsafe(coro, loop)
+
+    # Step 1: post the placeholder progress card.
+    progress_msg_id: str | None = None
+    try:
+        fut = _run_async(
+            adapter.send_message(chat_id, _THINKING_PLACEHOLDER, reply_to=msg.message_id)
+        )
+        progress_msg_id = fut.result(timeout=15)
+    except Exception:  # noqa: BLE001
+        log.warning("worker: placeholder send failed (continuing without progress card)",
+                    exc_info=True)
+
+    progress = {
+        "action": "🚀 启动中...",
+        "tool_calls": 0,
+        "preview": "",
+        "last_edit_ts": 0.0,
+    }
+
+    def _render_card(elapsed: float, *, final: bool = False) -> str:
+        head = "✅ 完成" if final else progress["action"]
+        lines = [f"*{head}*"]
+        if progress["tool_calls"]:
+            lines.append(f"🔧 已调用工具 {progress['tool_calls']} 次")
+        if progress["preview"]:
+            lines.append("")
+            lines.append(progress["preview"])
+        lines.append("")
+        lines.append(f"⏱ 已运行 {int(elapsed)}s")
+        return "\n".join(lines)
+
+    def _maybe_edit(elapsed: float, *, force: bool = False) -> None:
+        if not progress_msg_id:
+            return
+        now = time.monotonic()
+        if not force and now - progress["last_edit_ts"] < _CARD_EDIT_MIN_INTERVAL:
+            return
+        progress["last_edit_ts"] = now
+        # Fire-and-forget; UI failures must not poison the run.
+        text = _render_card(elapsed)
+        future = _run_async(adapter.edit_message(chat_id, progress_msg_id, text))
+
+        def _done(f):
+            exc = f.exception()
+            if exc is not None:
+                log.warning("progress edit failed (non-fatal): %s", exc)
+
+        future.add_done_callback(_done)
+
+    def on_event(ev: dict) -> None:
+        elapsed = ev.get("_elapsed", 0)
+        ev_type = ev.get("type")
+        sub = ev.get("subtype")
+
+        if ev_type == "system" and sub == "init":
+            progress["action"] = "🤔 思考中..."
+            log.info("stream: init session=%s", ev.get("session_id"))
+            _maybe_edit(elapsed, force=True)
+            return
+
+        if ev_type == "heartbeat":
+            if int(elapsed) % 30 == 0:
+                log.info("stream: heartbeat elapsed=%ss", int(elapsed))
+            _maybe_edit(elapsed)
+            return
+
+        if ev_type == "assistant":
+            for block in (ev.get("message") or {}).get("content") or []:
+                if not isinstance(block, dict):
+                    continue
+                btype = block.get("type")
+                if btype == "tool_use":
+                    progress["tool_calls"] += 1
+                    name = block.get("name", "?")
+                    summary = _summarise_tool(name, block.get("input") or {})
+                    log.info(
+                        "stream: tool_use #%d %s %s elapsed=%ss",
+                        progress["tool_calls"], name, summary[:120], int(elapsed),
+                    )
+                    label = f"🔧 [{name}] {summary}" if summary else f"🔧 [{name}]"
+                    progress["action"] = label[:_PROGRESS_PREVIEW_MAX]
+                    _maybe_edit(elapsed)
+                elif btype == "text":
+                    text = (block.get("text") or "").strip()
+                    if text:
+                        preview_lines = text.split("\n")[-3:]
+                        progress["preview"] = ("\n".join(preview_lines))[:_PROGRESS_PREVIEW_MAX]
+                        progress["action"] = "💭 思考中..."
+                        log.info(
+                            "stream: assistant text len=%d elapsed=%ss",
+                            len(text), int(elapsed),
+                        )
+                        _maybe_edit(elapsed)
+                elif btype == "thinking":
+                    progress["action"] = "💭 思考中..."
+                    _maybe_edit(elapsed)
+            return
+
+        if ev_type == "user":
+            for block in (ev.get("message") or {}).get("content") or []:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    progress["action"] = "✅ 工具结果已返回，继续..."
+                    log.info("stream: tool_result elapsed=%ss", int(elapsed))
+                    _maybe_edit(elapsed)
+                    break
+            return
+
+        if ev_type == "result":
+            log.info(
+                "stream: result elapsed=%ss is_error=%s len=%d",
+                int(elapsed), ev.get("is_error"), len((ev.get("result") or "")),
+            )
+            _maybe_edit(elapsed, force=True)
+            return
+
+    # Step 2: build prompt and run claude.
+    prompt = msg.text
+    if msg.attachments:
+        attach_lines = "\n".join(f"- file: {p}" for p in msg.attachments)
+        prompt = (
+            (msg.text + "\n\n" if msg.text else "")
+            + "[user attached the following file(s); use Read tool to inspect them if useful]\n"
+            + attach_lines
+        )
+    full_prompt = prompt + _BRIDGE_HINT_OUTBOUND_FILES
+
+    try:
+        resume = sessions.get(platform, chat_id)
+        log.info(
+            "worker: claude run platform=%s chat=%s prompt-len=%d resume=%s",
+            platform, chat_id, len(prompt), resume,
+        )
+        result = claude_run_stream(
+            full_prompt,
+            cfg.claude,
+            resume_session_id=resume,
+            on_event=on_event,
+        )
+        if result.session_id:
+            sessions.upsert(platform, chat_id, result.session_id)
+        reply = result.text
+        if result.is_error:
+            reply = f"⚠️ Claude 报错\n\n{reply}"
+        log.info(
+            "worker: done session=%s reply-len=%d tool_calls=%d is_error=%s",
+            result.session_id, len(reply), progress["tool_calls"], result.is_error,
+        )
+    except ClaudeRunError as e:
+        reply = f"⚠️ 桥接出错：{e}"
+        log.exception("worker: claude_runner failed")
+    except Exception as e:  # noqa: BLE001
+        reply = f"⚠️ 桥接出错：{type(e).__name__}: {e}"
+        log.exception("worker: unexpected error")
+
+    # Step 3: deliver text part (with [ATTACH:] markers stripped) + files.
+    text_part, attachments = _extract_attachments_from_reply(reply)
+    if attachments:
+        log.info("worker: claude requested %d attachment(s)", len(attachments))
+
+    chunks = _chunk(text_part) if text_part else [""]
+
+    delivered = 0
+    for i, chunk in enumerate(chunks, start=1):
+        body = chunk if len(chunks) == 1 else f"（{i}/{len(chunks)}）\n\n{chunk}"
+        body = body or "（无文字内容）"
+        try:
+            if i == 1 and progress_msg_id:
+                # Replace the placeholder with the first chunk.
+                _run_async(adapter.edit_message(chat_id, progress_msg_id, body)).result(timeout=30)
+            else:
+                _run_async(
+                    adapter.send_message(chat_id, body, reply_to=msg.message_id)
+                ).result(timeout=30)
+            delivered += 1
+        except Exception as e:  # noqa: BLE001
+            log.warning("worker: edit/send chunk %d/%d failed (%s); fallback to send",
+                        i, len(chunks), e)
+            try:
+                _run_async(
+                    adapter.send_message(chat_id, body, reply_to=msg.message_id)
+                ).result(timeout=30)
+                delivered += 1
+            except Exception:  # noqa: BLE001
+                log.exception("worker: fallback send chunk %d/%d failed",
+                              i, len(chunks))
+
+    for path in attachments:
+        try:
+            _run_async(adapter.send_file(chat_id, path)).result(timeout=120)
+        except Exception:  # noqa: BLE001
+            log.exception("worker: attach %s failed", path)
+
+    log.info(
+        "worker: delivered %d/%d chunks + %d attachments total-chars=%d",
+        delivered, len(chunks), len(attachments), len(reply),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Daemon entry
+# ---------------------------------------------------------------------------
+
+
+class Daemon:
+    def __init__(self, cfg: Config) -> None:
+        self.cfg = cfg
+        self.sessions = SessionStore(cfg.session.state_dir)
+        self.seen = _SeenEventCache()
+        self.executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="claude-worker")
+        # One lock per (platform, chat_id), so two fast messages from the same
+        # chat serialise (otherwise both resume the *previous* session_id and
+        # only one resulting session is recorded).
+        self._chat_locks: dict[tuple[str, str], asyncio.Lock] = {}
+        self._access: dict[str, AccessControl] = {}
+        self._adapters: list = []
+
+    def _chat_lock(self, platform: str, chat_id: str) -> asyncio.Lock:
+        key = (platform, chat_id)
+        lock = self._chat_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._chat_locks[key] = lock
+        return lock
+
+    async def _make_adapters(self) -> list:
+        adapters = []
+        inbound_dir = os.path.join(self.cfg.session.state_dir, "inbound")
+        if self.cfg.telegram.enabled:
+            from .adapters.telegram import TelegramAdapter
+            tg = TelegramAdapter(self.cfg.telegram.bot_token, inbound_dir=inbound_dir)
+            self._access["telegram"] = AccessControl(
+                self.cfg.telegram.allowed_user_ids,
+                self.cfg.telegram.group_only_when_mentioned,
+            )
+            adapters.append(tg)
+        if self.cfg.discord.enabled:
+            try:
+                from .adapters.discord import DiscordAdapter
+            except ImportError as e:
+                log.error("discord enabled but adapter import failed: %s", e)
+            else:
+                dc = DiscordAdapter(self.cfg.discord.bot_token, inbound_dir=inbound_dir)
+                self._access["discord"] = AccessControl(
+                    self.cfg.discord.allowed_user_ids,
+                    self.cfg.discord.group_only_when_mentioned,
+                )
+                adapters.append(dc)
+        return adapters
+
+    async def _on_message(self, msg) -> None:
+        # 1) dedupe
+        seen_key = f"{msg.platform}:{msg.message_id}"
+        if self.seen.check_and_add(seen_key):
+            log.info("dedupe: skipping repeated message %s", seen_key)
+            return
+
+        # 2) access
+        access = self._access.get(msg.platform)
+        if access is None:
+            log.warning("no access control configured for platform %s; rejecting",
+                        msg.platform)
+            return
+        if not access.allow(msg.user_id):
+            log.warning("access denied platform=%s user=%s", msg.platform, msg.user_id)
+            return
+        if msg.is_group and access.group_only_when_mentioned() and not msg.is_mentioned:
+            return
+
+        log.info(
+            "incoming: platform=%s chat=%s user=%s msg_id=%s text-len=%d attachments=%d",
+            msg.platform, msg.chat_id, msg.user_id, msg.message_id,
+            len(msg.text), len(msg.attachments),
+        )
+
+        # 3) per-chat serialisation + offload to worker
+        loop = asyncio.get_running_loop()
+        lock = self._chat_lock(msg.platform, msg.chat_id)
+
+        # Find the adapter for this platform.
+        adapter = next((a for a in self._adapters if a.platform == msg.platform), None)
+        if adapter is None:
+            log.error("no adapter for platform %s", msg.platform)
+            return
+
+        async def _runner():
+            async with lock:
+                # Run the blocking worker in a thread pool. We can't just
+                # asyncio.to_thread because we need a futures.Future to await
+                # without exceptions surfacing as crashes — so wrap in shield.
+                fut = loop.run_in_executor(
+                    self.executor,
+                    _process_message,
+                    msg, self.cfg, self.sessions, adapter, loop,
+                )
+                try:
+                    await fut
+                except Exception:  # noqa: BLE001
+                    log.exception("worker raised unhandled error")
+
+        # We don't await this — the bot adapter's handler must return
+        # promptly so polling continues. Track the task so it isn't GC'd.
+        task = asyncio.create_task(_runner())
+        task.add_done_callback(lambda _t: None)
+
+    async def run(self) -> None:
+        self._adapters = await self._make_adapters()
+        if not self._adapters:
+            raise RuntimeError("no adapters enabled — set telegram.enabled or discord.enabled")
+
+        async def _run_adapter(a):
+            log.info("starting adapter: %s", a.platform)
+            try:
+                await a.start(self._on_message)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                log.exception("adapter %s crashed; will restart in 5s", a.platform)
+                await asyncio.sleep(5)
+                raise
+
+        # If any adapter crashes, all crash → systemd restarts the whole
+        # daemon. Simpler than per-adapter resilience and safer for state.
+        await asyncio.gather(*(_run_adapter(a) for a in self._adapters))
+
+
+def run(config_path: str = "config.yaml") -> int:
+    _hydrate_claude_env()
+    cfg = Config.load(config_path)
+    cfg.expand_paths()
+
+    Path(cfg.session.state_dir).mkdir(parents=True, exist_ok=True)
+    Path(cfg.logging.file).parent.mkdir(parents=True, exist_ok=True)
+
+    logging.basicConfig(
+        level=getattr(logging, cfg.logging.level.upper(), logging.INFO),
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        handlers=[logging.StreamHandler(), logging.FileHandler(cfg.logging.file)],
+    )
+    log.info("starting im-claude-channel daemon")
+
+    daemon = Daemon(cfg)
+    try:
+        asyncio.run(daemon.run())
+    except KeyboardInterrupt:
+        log.info("interrupted; shutting down")
+    return 0

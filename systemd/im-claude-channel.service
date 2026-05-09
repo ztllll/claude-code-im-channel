@@ -1,0 +1,25 @@
+# Drop into ~/.config/systemd/user/im-claude-channel.service then:
+#   loginctl enable-linger $USER
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now im-claude-channel.service
+
+[Unit]
+Description=Telegram + Discord channel daemon for Claude Code
+Documentation=https://github.com/ztllll/claude-code-im-channel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/claude-code-im-channel
+EnvironmentFile=-%h/.config/im-claude-channel.env
+ExecStart=%h/claude-code-im-channel/.venv/bin/python -m im_claude_channel start -c %h/claude-code-im-channel/config.yaml
+Restart=always
+RestartSec=5s
+
+# Resource caps — claude subprocess can eat a lot under tool-heavy turns.
+MemoryHigh=2G
+MemoryMax=4G
+
+[Install]
+WantedBy=default.target
