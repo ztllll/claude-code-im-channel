@@ -182,6 +182,14 @@ def run_stream(
     final_event: dict | None = None
     last_session_id: str | None = None
     last_text: str = ""
+    # Accumulate every assistant text block seen during the turn — claude
+    # may emit text *before* a tool_use (a quick "收到" / "let me check"
+    # ack) and again *after* the tool_use comes back. The result event's
+    # `result` field only carries the LAST block, so without this we drop
+    # the lead-in text. We dedupe on the exact slice to handle cases where
+    # the model edits a partial text block via streaming deltas.
+    all_text_blocks: list[str] = []
+    seen_text_blocks: set[str] = set()
 
     def _emit(ev: dict) -> None:
         if on_event is None:
@@ -262,6 +270,17 @@ def run_stream(
             if sid:
                 last_session_id = sid
 
+            # Capture each assistant text block as it streams — see the
+            # all_text_blocks comment above for why we don't just use the
+            # final result.result field.
+            if ev.get("type") == "assistant":
+                for block in (ev.get("message") or {}).get("content") or []:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        t = (block.get("text") or "").strip()
+                        if t and t not in seen_text_blocks:
+                            seen_text_blocks.add(t)
+                            all_text_blocks.append(t)
+
             is_terminal = ev.get("type") == "result"
             if is_terminal:
                 final_event = ev
@@ -332,8 +351,16 @@ def run_stream(
             final_event.get("subtype") or final_event.get("error") or "<no detail>",
         )
 
+    # Prefer the accumulated text (covers multi-block turns); fall back to
+    # result.result only if for some reason no assistant text streamed.
+    full_text = "\n\n".join(all_text_blocks).strip() or last_text or "(empty)"
+    if all_text_blocks and last_text and last_text not in "\n\n".join(all_text_blocks):
+        # belt-and-suspenders: if the result text wasn't seen as a
+        # streaming block (rare protocol corner case), append it.
+        full_text = (full_text + "\n\n" + last_text).strip()
+
     return ClaudeResult(
-        text=last_text or "(empty)",
+        text=full_text,
         session_id=last_session_id,
         is_error=is_error,
         raw=final_event,
