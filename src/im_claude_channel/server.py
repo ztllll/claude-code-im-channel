@@ -315,7 +315,11 @@ def _process_message(
                 "stream: result elapsed=%ss is_error=%s len=%d",
                 int(elapsed), ev.get("is_error"), len((ev.get("result") or "")),
             )
-            _maybe_edit(elapsed, force=True)
+            # Don't force-edit here. Step 3 (worker post-stream) is about to
+            # replace this message with the full reply; firing an edit now
+            # races with that and can land *after* the final edit on
+            # Telegram's side, leaving the user looking at the progress card
+            # forever. Let step 3 own the final state.
             return
 
     # Step 2: build prompt and run claude.
