@@ -110,6 +110,31 @@ class SessionStore:
             )
             conn.commit()
 
+    def swap_session(self, platform: str, chat_id: str, new_session_id: str) -> None:
+        """Replace the session_id (used by /compact) without touching label or
+        cumulative_cost_usd. The last_* token counters are zeroed because they
+        belong to the *previous* session — the next ``record_usage`` call will
+        repopulate them for the new session.
+        """
+        now = time.time()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE sessions
+                SET session_id = ?,
+                    last_active_ts = ?,
+                    last_input_tokens = 0,
+                    last_cache_read_tokens = 0,
+                    last_cache_creation_tokens = 0,
+                    last_output_tokens = 0,
+                    last_model = NULL,
+                    context_window = 0
+                WHERE platform = ? AND chat_id = ?
+                """,
+                (new_session_id, now, platform, chat_id),
+            )
+            conn.commit()
+
     def set_label(self, platform: str, chat_id: str, label: str | None) -> None:
         """Set/clear the human-readable label for a chat.
 

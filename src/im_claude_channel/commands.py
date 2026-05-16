@@ -118,7 +118,7 @@ MENU: list[tuple[str, str]] = [
 
     # —— 当前 session 状态调整（TUI 限定，远程基本只能拿到文字解释） ——
     ("clear", "[TUI] 清空当前 session 上下文（-p 没意义）"),
-    ("compact", "[TUI] 压缩当前对话省 token"),
+    ("compact", "压缩当前 chat（让模型总结 → 开新 session 灌入摘要，省 token）"),
     ("focus", "[TUI] 切换 focus 视图"),
     ("color", "[TUI] 改 prompt bar 颜色"),
     ("effort", "[TUI] 切 effort 级别（low/medium/high/xhigh/max）"),

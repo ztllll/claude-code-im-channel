@@ -423,6 +423,195 @@ def _process_message(
 
 
 # ---------------------------------------------------------------------------
+# /compact worker — summarise current session then bootstrap a new one with
+# the summary as its first message. Two blocking claude calls, so runs in the
+# same thread pool as _process_message.
+# ---------------------------------------------------------------------------
+
+
+_COMPACT_SUMMARY_PROMPT_TEMPLATE = (
+    "<<system_compaction>>\n"
+    "You are about to be compacted. Summarise the entire conversation above "
+    "as concisely as possible while preserving everything needed to continue "
+    "working in a fresh session. Include:\n"
+    "  - The user's overarching goal(s) and current focus area\n"
+    "  - Key technical decisions made, with brief reasoning\n"
+    "  - Open questions, blockers, and pending TODOs\n"
+    "  - Important file paths, function names, identifiers, URLs the user has been working with\n"
+    "  - Any commitments the assistant made (\"I will…\", \"next I'll…\")\n"
+    "  - The most recent meaningful state of the work\n"
+    "{focus_section}"
+    "\nDo NOT include greetings, meta-commentary, or 'here is the summary'. "
+    "Return ONLY the summary content, in whatever format (prose, bullets, "
+    "code blocks) best preserves the information."
+)
+
+
+def _build_summary_prompt(focus_hint: str) -> str:
+    focus_section = (
+        f"\nUser-supplied focus for this compact: {focus_hint}\n"
+        if focus_hint
+        else ""
+    )
+    return _COMPACT_SUMMARY_PROMPT_TEMPLATE.format(focus_section=focus_section)
+
+
+def _bootstrap_prompt(summary_text: str) -> str:
+    return (
+        "[Previous conversation context — compacted summary]\n\n"
+        f"{summary_text}\n\n"
+        "[End of summary]\n\n"
+        "Please acknowledge this context briefly (one sentence) so I know "
+        "you've loaded it; then wait for the user's next message."
+    )
+
+
+def _process_compact(
+    *,
+    msg,                   # IncomingMessage
+    cfg: Config,
+    sessions: SessionStore,
+    adapter,               # Adapter
+    loop: asyncio.AbstractEventLoop,
+    cancels: CancelRegistry,
+    focus_hint: str,
+) -> None:
+    """Two-step compact: claude summarises → fresh claude session seeded with summary."""
+
+    chat_id = msg.chat_id
+    platform = msg.platform
+
+    def _run_async(coro):
+        return asyncio.run_coroutine_threadsafe(coro, loop)
+
+    # Step 0: post placeholder.
+    progress_msg_id: str | None = None
+    try:
+        fut = _run_async(
+            adapter.send_message(chat_id, "🔧 准备 compact…", reply_to=msg.message_id)
+        )
+        progress_msg_id = fut.result(timeout=15)
+    except Exception:  # noqa: BLE001
+        log.warning("compact: placeholder send failed", exc_info=True)
+
+    def _edit(text: str) -> None:
+        if not progress_msg_id:
+            return
+        try:
+            _run_async(adapter.edit_message(chat_id, progress_msg_id, text)).result(timeout=30)
+        except Exception:  # noqa: BLE001
+            log.warning("compact: edit failed (non-fatal)", exc_info=True)
+
+    old_sid = sessions.get(platform, chat_id)
+    if not old_sid:
+        _edit("ℹ️ 本 chat 没有 session，无需 compact。直接发消息开始即可。")
+        return
+
+    u_before = sessions.get_usage(platform, chat_id) or {}
+    old_ctx = (
+        u_before.get("last_input_tokens", 0)
+        + u_before.get("last_cache_read_tokens", 0)
+        + u_before.get("last_cache_creation_tokens", 0)
+    )
+
+    # Step 1: summarise the existing session.
+    pretty_old = f"{old_ctx:,}" if old_ctx else "(未知 — 升级前没有 usage 记录)"
+    _edit(f"🤔 [1/2] 让模型总结现有上下文 ({pretty_old} tokens)…")
+    log.info(
+        "compact: starting summary turn platform=%s chat=%s old_sid=%s old_ctx=%d focus=%r",
+        platform, chat_id, old_sid, old_ctx, focus_hint,
+    )
+
+    try:
+        summary_result = claude_run_stream(
+            _build_summary_prompt(focus_hint),
+            cfg.claude,
+            resume_session_id=old_sid,
+        )
+    except ClaudeRunError as e:
+        log.exception("compact: summary turn failed")
+        _edit(f"⚠️ compact 第 1 步失败：{e}\n\n旧 session 不动，可继续对话。")
+        return
+    if summary_result.is_error or not summary_result.text:
+        _edit("⚠️ compact 第 1 步：模型返回空或错误。旧 session 不动，可继续对话。")
+        return
+
+    summary_text = summary_result.text
+    raw1 = summary_result.raw or {}
+    cost1 = float(raw1.get("total_cost_usd") or 0.0)
+
+    # Step 2: spawn a new session with the summary as the bootstrap prompt.
+    _edit(f"🔧 [2/2] 开新 session，灌入 {len(summary_text):,} 字摘要…")
+    log.info(
+        "compact: starting bootstrap turn summary-len=%d cost1=$%.4f",
+        len(summary_text), cost1,
+    )
+
+    try:
+        bootstrap_result = claude_run_stream(
+            _bootstrap_prompt(summary_text),
+            cfg.claude,
+            resume_session_id=None,
+        )
+    except ClaudeRunError as e:
+        log.exception("compact: bootstrap turn failed")
+        _edit(
+            f"⚠️ compact 第 2 步失败：{e}\n\n"
+            f"摘要拿到了但没能落到新 session。旧 session 不动，可继续对话。"
+        )
+        return
+
+    new_sid = bootstrap_result.session_id
+    if not new_sid:
+        _edit("⚠️ compact 第 2 步：拿不到新 session_id。旧 session 不动。")
+        return
+
+    raw2 = bootstrap_result.raw or {}
+    cost2 = float(raw2.get("total_cost_usd") or 0.0)
+
+    # Atomic swap and record the bootstrap turn's usage as the new baseline.
+    sessions.swap_session(platform, chat_id, new_sid)
+    sessions.record_usage(
+        platform, chat_id,
+        model_usage=raw2.get("modelUsage") or {},
+        total_cost_usd=cost2,
+    )
+
+    u_after = sessions.get_usage(platform, chat_id) or {}
+    new_ctx = (
+        u_after.get("last_input_tokens", 0)
+        + u_after.get("last_cache_read_tokens", 0)
+        + u_after.get("last_cache_creation_tokens", 0)
+    )
+
+    cost_total = cost1 + cost2
+    saved = old_ctx - new_ctx
+    if old_ctx > 0 and saved > 0:
+        saved_line = f"节省 `{saved:,}` tokens (`{saved / old_ctx * 100:.1f}%`)"
+    elif old_ctx > 0:
+        saved_line = f"新上下文反而大了 `{-saved:,}` tokens（摘要太冗长？）"
+    else:
+        saved_line = "(旧上下文未知，无法计算节省)"
+
+    log.info(
+        "compact: done old_sid=%s → new_sid=%s old_ctx=%d new_ctx=%d cost=$%.4f",
+        old_sid, new_sid, old_ctx, new_ctx, cost_total,
+    )
+
+    _edit(
+        f"✅ Compact 完成\n\n"
+        f"旧 session: `{old_sid[:8]}…`\n"
+        f"新 session: `{new_sid[:8]}…`\n\n"
+        f"上下文: `{old_ctx:,}` → `{new_ctx:,}` tokens\n"
+        f"{saved_line}\n"
+        f"摘要长度: `{len(summary_text):,}` 字\n"
+        f"本次 compact 花费: `${cost_total:.4f}` "
+        f"(总结 `${cost1:.4f}` + bootstrap `${cost2:.4f}`)\n\n"
+        f"下条消息会在新 session 里继续。"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Daemon entry
 # ---------------------------------------------------------------------------
 
@@ -530,6 +719,40 @@ class Daemon:
         parsed = parse_command(msg.text)
         if parsed is not None:
             name, args = parsed
+
+            # /compact needs the worker pool (two blocking claude calls), so
+            # it's intercepted BEFORE dispatch_command (which is synchronous
+            # and returns CommandResult).
+            if name == "compact":
+                log.info("command: %s/%s ran /compact (worker, focus=%r)",
+                         msg.platform, msg.chat_id, args)
+                loop = asyncio.get_running_loop()
+                lock = self._chat_lock(msg.platform, msg.chat_id)
+
+                async def _compact_runner():
+                    async with lock:
+                        fut = loop.run_in_executor(
+                            self.executor,
+                            functools.partial(
+                                _process_compact,
+                                msg=msg,
+                                cfg=self.cfg,
+                                sessions=self.sessions,
+                                adapter=adapter,
+                                loop=loop,
+                                cancels=self.cancels,
+                                focus_hint=args,
+                            ),
+                        )
+                        try:
+                            await fut
+                        except Exception:  # noqa: BLE001
+                            log.exception("compact worker raised unhandled error")
+
+                task = asyncio.create_task(_compact_runner())
+                task.add_done_callback(lambda _t: None)
+                return
+
             result = dispatch_command(
                 name,
                 sessions=self.sessions,
