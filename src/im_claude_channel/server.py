@@ -352,6 +352,16 @@ def _process_message(
         )
         if result.session_id:
             sessions.upsert(platform, chat_id, result.session_id)
+        # Snapshot per-turn token usage + accumulate cost so /context can
+        # surface real numbers (claude's own /context only sees a fresh
+        # session, not our resumed long-running one).
+        raw = result.raw or {}
+        sessions.record_usage(
+            platform,
+            chat_id,
+            model_usage=raw.get("modelUsage") or {},
+            total_cost_usd=float(raw.get("total_cost_usd") or 0.0),
+        )
         reply = result.text
         if result.is_error:
             reply = f"⚠️ Claude 报错\n\n{reply}"

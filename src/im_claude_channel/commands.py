@@ -92,6 +92,7 @@ MENU: list[tuple[str, str]] = [
     ("menu", "显示分组命令菜单（/help 的同义词）"),
     ("help", "列出可用命令"),
     ("rename", "给当前 chat 起人类可读的标签（/rename 飞书会话；/rename 留空清除）"),
+    ("context", "当前 chat 的真实上下文用量（模型、token、缓存命中、累计成本）"),
 
     # —— skill 透传（远程能用，会真的产生输出） ——
     ("review", "审查当前分支或 PR"),
@@ -118,7 +119,6 @@ MENU: list[tuple[str, str]] = [
     # —— 当前 session 状态调整（TUI 限定，远程基本只能拿到文字解释） ——
     ("clear", "[TUI] 清空当前 session 上下文（-p 没意义）"),
     ("compact", "[TUI] 压缩当前对话省 token"),
-    ("context", "[TUI] 可视化上下文使用网格"),
     ("focus", "[TUI] 切换 focus 视图"),
     ("color", "[TUI] 改 prompt bar 颜色"),
     ("effort", "[TUI] 切 effort 级别（low/medium/high/xhigh/max）"),
@@ -173,7 +173,7 @@ MENU: list[tuple[str, str]] = [
 ]
 
 # Daemon intercepts these — everything else is forwarded to claude.
-_DAEMON_HANDLED = {"new", "cancel", "status", "sessions", "log", "help", "menu", "rename"}
+_DAEMON_HANDLED = {"new", "cancel", "status", "sessions", "log", "help", "menu", "rename", "context"}
 
 
 # Curated grouped menu shown by /menu. Kept as a constant so we can iterate
@@ -408,6 +408,44 @@ def dispatch(
         # dump. The full 69-entry list is always available via Telegram's
         # native `/` autocomplete (we wrote it via setMyCommands).
         return CommandResult(text=_MENU_TEXT)
+
+    if name == "context":
+        u = sessions.get_usage(platform, chat_id)
+        if not u or not u.get("last_model"):
+            return CommandResult(
+                text="ℹ️ 当前 chat 还没有完整的 claude turn，无法统计上下文。"
+                     "先发一条普通消息触发一次即可。"
+            )
+        label_part = f" [{u['label']}]" if u.get("label") else ""
+        total_ctx = (
+            u["last_input_tokens"]
+            + u["last_cache_read_tokens"]
+            + u["last_cache_creation_tokens"]
+        )
+        cw = u["context_window"] or 0
+        pct = (total_ctx / cw * 100) if cw else 0.0
+        cache_hit_pct = (
+            (u["last_cache_read_tokens"] / total_ctx * 100) if total_ctx else 0.0
+        )
+        cw_disp = f"{cw:,}" if cw else "(未知)"
+        return CommandResult(
+            text=(
+                f"*📊 上下文使用{label_part}*\n"
+                f"模型: `{u['last_model']}`\n"
+                f"上下文窗口: `{cw_disp}`\n\n"
+                f"*最近一轮*\n"
+                f"输入 (billed): `{u['last_input_tokens']:,}` tokens\n"
+                f"缓存命中: `{u['last_cache_read_tokens']:,}` tokens "
+                f"(`{cache_hit_pct:.0f}%`)\n"
+                f"缓存写入: `{u['last_cache_creation_tokens']:,}` tokens\n"
+                f"输出: `{u['last_output_tokens']:,}` tokens\n"
+                f"已用上下文: `{total_ctx:,}` / `{cw_disp}`"
+                + (f" (`{pct:.1f}%`)" if cw else "")
+                + "\n\n"
+                f"*累计 (本 chat {u['message_count']} 轮)*\n"
+                f"总成本: `${u['cumulative_cost_usd']:.4f}`"
+            )
+        )
 
     if name == "rename":
         # /rename <label>   set the label for THIS chat
