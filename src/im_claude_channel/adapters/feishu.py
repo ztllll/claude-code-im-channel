@@ -374,9 +374,20 @@ class FeishuAdapter:
             log_level=self._sdk_log_level,
         )
         log.info("feishu adapter connecting (long-conn) ...")
-        # lark.ws.Client.start() blocks until the connection ends.
-        # Run it in a thread so the asyncio loop stays free.
-        await asyncio.to_thread(self._cli.start)
+        # lark-oapi's WsClient.start() runs every coroutine on a *module-level*
+        # ``loop`` captured at import time via ``asyncio.get_event_loop()``.
+        # When the adapter is imported inside our running daemon, that grab
+        # returns the main daemon loop — and ``loop.run_until_complete()`` from
+        # a worker thread then fails with "loop already running". Fix: create a
+        # fresh loop in the worker thread and force-rebind lark's module global
+        # before letting it call start().
+        import lark_oapi.ws.client as _lark_ws_client  # noqa: WPS433
+        def _run_with_fresh_loop() -> None:
+            new_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(new_loop)
+            _lark_ws_client.loop = new_loop
+            self._cli.start()
+        await asyncio.to_thread(_run_with_fresh_loop)
         log.info("feishu adapter stopped")
 
     async def stop(self) -> None:
