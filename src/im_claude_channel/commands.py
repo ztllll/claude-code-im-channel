@@ -123,7 +123,7 @@ MENU: list[tuple[str, str]] = [
     ("color", "[TUI] 改 prompt bar 颜色"),
     ("effort", "[TUI] 切 effort 级别（low/medium/high/xhigh/max）"),
     ("fast", "[TUI] 切 fast 模式（仅 Opus 4.6）"),
-    ("model", "[TUI] 切模型（sonnet/opus 等）"),
+    ("model", "切换当前 chat 的模型（/model sonnet|opus|haiku 或完整 ID；/model 查看；/model clear 恢复全局）"),
     ("agents", "[TUI] 管理 agent 配置"),
     ("add_dir", "[TUI] 给当前 session 加工作目录"),
     ("copy", "[TUI] 复制最近回复到剪贴板"),
@@ -173,7 +173,7 @@ MENU: list[tuple[str, str]] = [
 ]
 
 # Daemon intercepts these — everything else is forwarded to claude.
-_DAEMON_HANDLED = {"new", "cancel", "status", "sessions", "log", "help", "menu", "rename", "context"}
+_DAEMON_HANDLED = {"new", "cancel", "status", "sessions", "log", "help", "menu", "rename", "context", "model"}
 
 
 # Curated grouped menu shown by /menu. Kept as a constant so we can iterate
@@ -181,7 +181,7 @@ _DAEMON_HANDLED = {"new", "cancel", "status", "sessions", "log", "help", "menu",
 _MENU_TEXT = """*🛠 命令菜单*
 
 *daemon 控制（秒回）*
-`/new` 开新对话 · `/cancel` 取消 turn · `/status` 状态 · `/sessions` 全部会话 · `/log` 日志尾 · `/help` 命令清单
+`/new` 开新对话 · `/cancel` 取消 turn · `/status` 状态 · `/sessions` 全部会话 · `/log` 日志尾 · `/help` 命令清单 · `/model` 切换模型
 
 *🔍 代码审查（透传 claude）*
 `/review` 审分支 · `/security-review` 安全审查 · `/simplify` 代码质量 · `/ultrareview` 多 agent 云端审
@@ -199,7 +199,7 @@ _MENU_TEXT = """*🛠 命令菜单*
 `/update-config` 改 settings.json · `/fewer-permission-prompts` 加 allowlist · `/keybindings-help` 改快捷键 · `/agent-reach` 配 Twitter 等 · `/claude-api` SDK 编码助手
 
 —
-`[TUI]` 系列（/clear /compact /model /permissions 等 30+）远程基本只能拿到文字解释。
+`[TUI]` 系列（/clear /permissions 等 30+）远程基本只能拿到文字解释。
 完整 69 项：直接打 `/` 看 Telegram 自动补全。"""
 
 # Some commands claude knows by a hyphenated name; menu entries use
@@ -313,6 +313,7 @@ def dispatch(
     cancel_registry: CancelRegistry | None = None,
     log_file: str | None = None,
     args: str = "",
+    global_model: str | None = None,
 ) -> CommandResult | None:
     """Handle a daemon-side command. Returns None to fall through to claude.
 
@@ -445,6 +446,57 @@ def dispatch(
                 f"*累计 (本 chat {u['message_count']} 轮)*\n"
                 f"总成本: `${u['cumulative_cost_usd']:.4f}`"
             )
+        )
+
+    if name == "model":
+        _ALIASES = {
+            "opus":   "claude-opus-4-7",
+            "sonnet": "claude-sonnet-4-6",
+            "haiku":  "claude-haiku-4-5-20251001",
+        }
+        _KNOWN = [
+            "claude-opus-4-7",
+            "claude-sonnet-4-6",
+            "claude-haiku-4-5-20251001",
+        ]
+        arg = args.strip().lower()
+        current_override = sessions.get_model_override(platform, chat_id)
+        effective = current_override or global_model or "(claude CLI 默认)"
+
+        if not arg or arg == "list":
+            lines = [
+                "*🤖 模型设置*",
+                f"当前生效: `{effective}`",
+            ]
+            if current_override:
+                lines.append(f"本 chat 固定: `{current_override}`")
+            if global_model:
+                lines.append(f"全局配置: `{global_model}`")
+            lines += [
+                "",
+                "*常用模型*",
+                "`opus`   → `claude-opus-4-7`（最强，贵）",
+                "`sonnet` → `claude-sonnet-4-6`（默认推荐）",
+                "`haiku`  → `claude-haiku-4-5-20251001`（最快最省）",
+                "",
+                "用法: `/model sonnet` 或 `/model claude-opus-4-7`",
+                "恢复: `/model clear`",
+            ]
+            return CommandResult(text="\n".join(lines))
+
+        if arg in ("clear", "default", "none", "reset"):
+            sessions.set_model_override(platform, chat_id, None)
+            fallback = global_model or "(claude CLI 默认)"
+            return CommandResult(
+                text=f"✅ 已清除本 chat 模型固定，恢复使用 `{fallback}`。"
+            )
+
+        model_id = _ALIASES.get(arg, args.strip())
+        sessions.set_model_override(platform, chat_id, model_id)
+        note = "（下一个 turn 生效）" if sessions.get(platform, chat_id) else ""
+        return CommandResult(
+            text=f"✅ 本 chat 模型已固定为 `{model_id}`{note}。\n"
+                 f"发 `/model clear` 恢复全局设置。"
         )
 
     if name == "rename":

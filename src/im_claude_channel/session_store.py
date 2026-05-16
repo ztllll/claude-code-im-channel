@@ -49,6 +49,7 @@ _LATE_COLUMNS = [
     ("cumulative_cost_usd", "REAL NOT NULL DEFAULT 0.0"),
     ("last_model", "TEXT"),
     ("context_window", "INTEGER NOT NULL DEFAULT 0"),
+    ("model_override", "TEXT"),
 ]
 
 
@@ -158,6 +159,28 @@ class SessionStore:
         with self._lock, self._connect() as conn:
             row = conn.execute(
                 "SELECT label FROM sessions WHERE platform = ? AND chat_id = ?",
+                (platform, chat_id),
+            ).fetchone()
+        return row[0] if row else None
+
+    def set_model_override(self, platform: str, chat_id: str, model: str | None) -> None:
+        """Pin or clear a per-chat model override (used by /model <name>)."""
+        now = time.time()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO sessions (platform, chat_id, session_id, last_active_ts, message_count, model_override)
+                VALUES (?, ?, '', ?, 0, ?)
+                ON CONFLICT(platform, chat_id) DO UPDATE SET model_override = excluded.model_override
+                """,
+                (platform, chat_id, now, model),
+            )
+            conn.commit()
+
+    def get_model_override(self, platform: str, chat_id: str) -> str | None:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT model_override FROM sessions WHERE platform = ? AND chat_id = ?",
                 (platform, chat_id),
             ).fetchone()
         return row[0] if row else None

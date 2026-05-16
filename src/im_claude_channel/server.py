@@ -339,13 +339,26 @@ def _process_message(
     cancel_event = cancels.arm(platform, chat_id)
     try:
         resume = sessions.get(platform, chat_id)
+        # Apply per-chat model override if set (strips any existing --model flag
+        # from extra_args to avoid duplicates, then appends the override).
+        runtime_claude_cfg = cfg.claude
+        model_override = sessions.get_model_override(platform, chat_id)
+        if model_override:
+            import dataclasses
+            stripped = [
+                a for i, a in enumerate(cfg.claude.extra_args)
+                if a != "--model" and (i == 0 or cfg.claude.extra_args[i - 1] != "--model")
+            ]
+            runtime_claude_cfg = dataclasses.replace(
+                cfg.claude, extra_args=stripped + ["--model", model_override]
+            )
         log.info(
-            "worker: claude run platform=%s chat=%s prompt-len=%d resume=%s",
-            platform, chat_id, len(prompt), resume,
+            "worker: claude run platform=%s chat=%s prompt-len=%d resume=%s model=%s",
+            platform, chat_id, len(prompt), resume, model_override or "(global)",
         )
         result = claude_run_stream(
             full_prompt,
-            cfg.claude,
+            runtime_claude_cfg,
             resume_session_id=resume,
             on_event=on_event,
             cancel_check=cancel_event.is_set,
@@ -753,6 +766,11 @@ class Daemon:
                 task.add_done_callback(lambda _t: None)
                 return
 
+            extra = self.cfg.claude.extra_args
+            try:
+                global_model: str | None = extra[extra.index("--model") + 1]
+            except (ValueError, IndexError):
+                global_model = None
             result = dispatch_command(
                 name,
                 sessions=self.sessions,
@@ -762,6 +780,7 @@ class Daemon:
                 cancel_registry=self.cancels,
                 log_file=self.cfg.logging.file,
                 args=args,
+                global_model=global_model,
             )
             if result is not None:
                 log.info("command: %s/%s ran /%s (daemon-handled)",
