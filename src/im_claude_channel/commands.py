@@ -89,6 +89,7 @@ MENU: list[tuple[str, str]] = [
     ("status", "查看 daemon 与本 chat 的会话状态"),
     ("sessions", "列出所有 chat 的活动 session"),
     ("log", "显示 daemon 最近 30 行日志"),
+    ("menu", "显示分组命令菜单（/help 的同义词）"),
     ("help", "列出可用命令"),
 
     # —— skill 透传（远程能用，会真的产生输出） ——
@@ -172,7 +173,34 @@ MENU: list[tuple[str, str]] = [
 ]
 
 # Daemon intercepts these — everything else is forwarded to claude.
-_DAEMON_HANDLED = {"new", "cancel", "status", "sessions", "log", "help"}
+_DAEMON_HANDLED = {"new", "cancel", "status", "sessions", "log", "help", "menu"}
+
+
+# Curated grouped menu shown by /menu. Kept as a constant so we can iterate
+# on copy without rebuilding the whole list every call.
+_MENU_TEXT = """*🛠 命令菜单*
+
+*daemon 控制（秒回）*
+`/new` 开新对话 · `/cancel` 取消 turn · `/status` 状态 · `/sessions` 全部会话 · `/log` 日志尾 · `/help` 命令清单
+
+*🔍 代码审查（透传 claude）*
+`/review` 审分支 · `/security-review` 安全审查 · `/simplify` 代码质量 · `/ultrareview` 多 agent 云端审
+
+*📝 仓库 / PR*
+`/init` 生成 CLAUDE.md · `/autofix-pr` 修 PR · `/branch` 旁支问题 · `/recap` 会话总结
+
+*🔧 诊断 / 信息*
+`/doctor` 诊断安装 · `/release-notes` 版本变更 · `/advisor` 强模型建议 · `/btw` 顺手问题
+
+*📚 记忆 / 计划*
+`/memory` 编辑记忆 · `/plan` 进入 plan 模式 · `/todo` 待办
+
+*⚙ 配置 / 助手*
+`/update-config` 改 settings.json · `/fewer-permission-prompts` 加 allowlist · `/keybindings-help` 改快捷键 · `/agent-reach` 配 Twitter 等 · `/claude-api` SDK 编码助手
+
+—
+`[TUI]` 系列（/clear /compact /model /permissions 等 30+）远程基本只能拿到文字解释。
+完整 69 项：直接打 `/` 看 Telegram 自动补全。"""
 
 # Some commands claude knows by a hyphenated name; menu entries use
 # underscores (telegram requirement) and we rewrite on the way out so
@@ -365,5 +393,11 @@ def dispatch(
         lines.append("")
         lines.append("其他任何文本会作为 prompt 发给 claude。")
         return CommandResult(text="\n".join(lines))
+
+    if name == "menu":
+        # Curated, grouped quick reference — friendlier than the flat /help
+        # dump. The full 69-entry list is always available via Telegram's
+        # native `/` autocomplete (we wrote it via setMyCommands).
+        return CommandResult(text=_MENU_TEXT)
 
     return None
