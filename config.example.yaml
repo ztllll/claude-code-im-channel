@@ -1,28 +1,62 @@
 # im-claude-channel — daemon config.
-# Copy to config.yaml and fill in. Real config.yaml is gitignored.
+#
+# Copy to config.yaml and fill in. The real config.yaml is gitignored.
+# All bot tokens / app secrets also accept env var overrides:
+#   TELEGRAM_BOT_TOKEN, DISCORD_BOT_TOKEN, FEISHU_APP_ID, FEISHU_APP_SECRET
+# Env wins over the file — useful for systemd EnvironmentFile setups.
 
+# ---------------------------------------------------------------------------
+# Telegram — Bot API long-polling via aiogram. Get a bot token from @BotFather.
+# ---------------------------------------------------------------------------
 telegram:
-  enabled: true
-  bot_token: ""           # also overridable via env: TELEGRAM_BOT_TOKEN
+  enabled: false
+  bot_token: ""
   # Telegram numeric user_ids that may invoke claude. Leave empty to allow
-  # everyone (only safe if the bot is invite-only at the platform level).
+  # everyone (only safe if the bot itself is invite-only).
   allowed_user_ids:
-    - "8570415194"
+    - "REPLACE_WITH_YOUR_TELEGRAM_USER_ID"
+  # Group chats: only react when the bot is @-mentioned or replied to.
   group_only_when_mentioned: true
 
+# ---------------------------------------------------------------------------
+# Discord — gateway WebSocket via discord.py. Create an app + bot at
+# https://discord.com/developers/applications and enable the
+# `message_content` privileged intent.
+# ---------------------------------------------------------------------------
 discord:
-  enabled: false          # flip on once telegram is verified stable
-  bot_token: ""           # env: DISCORD_BOT_TOKEN
+  enabled: false
+  bot_token: ""
+  # Discord snowflake user_ids (strings). Empty list = allow everyone.
   allowed_user_ids: []
   group_only_when_mentioned: true
 
+# ---------------------------------------------------------------------------
+# Feishu / Lark — long connection via lark-oapi. Get app_id + app_secret from
+# https://open.feishu.cn/app → 应用详情 → 凭证与基础信息.
+# Open both "im:message" + "im:resource" scopes for the bot.
+# ---------------------------------------------------------------------------
+feishu:
+  enabled: false
+  app_id: ""              # cli_xxxxxxxxxxxxxxxx
+  app_secret: ""          # 32-char secret
+  # Feishu open_ids (ou_xxxxxxxxxxxxxxxxxxxxxxxxxxx). Empty = allow everyone
+  # in the bot's reach.
+  allowed_user_ids: []
+  group_only_when_mentioned: true
+  # SDK log level. DEBUG floods the daemon log with lark ping/pong every 30s
+  # — only useful when debugging the long-conn itself.
+  log_level: INFO
+
+# ---------------------------------------------------------------------------
+# Claude CLI subprocess
+# ---------------------------------------------------------------------------
 claude:
   binary: claude
-  # Where claude runs. CRITICAL: claude indexes sessions per project (cwd),
-  # so to inherit sessions from an existing tmux'd `claude --channels ...`
-  # you must set this to whatever cwd that tmux was using. For "claude
-  # launched from /" the value is "/". Sessions then land in
-  # ~/.claude/projects/-/ on disk and `--resume <id>` finds them.
+  # Working directory the subprocess runs in. CRITICAL: claude indexes
+  # sessions per project (cwd), so to inherit sessions from an existing
+  # tmux'd `claude --channels ...` you must set this to whatever cwd that
+  # tmux was using. For "claude launched from /" the value is "/". Sessions
+  # then land in ~/.claude/projects/-/ on disk and `--resume <id>` finds them.
   work_dir: "/"
   # Extra flags appended to `claude -p`. Use to pin model, skip permissions, etc.
   extra_args:
@@ -30,6 +64,9 @@ claude:
   timeout_seconds: 7200       # hard ceiling per turn
   idle_timeout_seconds: 900   # kill subprocess if no events for this long
 
+# ---------------------------------------------------------------------------
+# Session store (SQLite) — maps (platform, chat_id) → claude session_id.
+# ---------------------------------------------------------------------------
 session:
   state_dir: ~/.im-claude-channel
   archive_after_days: 14

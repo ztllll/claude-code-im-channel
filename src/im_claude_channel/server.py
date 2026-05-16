@@ -467,6 +467,23 @@ class Daemon:
                     self.cfg.discord.group_only_when_mentioned,
                 )
                 adapters.append(dc)
+        if self.cfg.feishu.enabled:
+            try:
+                from .adapters.feishu import FeishuAdapter
+            except ImportError as e:
+                log.error("feishu enabled but adapter import failed: %s", e)
+            else:
+                fs = FeishuAdapter(
+                    self.cfg.feishu.app_id,
+                    self.cfg.feishu.app_secret,
+                    inbound_dir=inbound_dir,
+                    log_level=self.cfg.feishu.log_level,
+                )
+                self._access["feishu"] = AccessControl(
+                    self.cfg.feishu.allowed_user_ids,
+                    self.cfg.feishu.group_only_when_mentioned,
+                )
+                adapters.append(fs)
         return adapters
 
     async def _on_message(self, msg) -> None:

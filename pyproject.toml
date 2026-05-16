@@ -4,17 +4,17 @@ build-backend = "hatchling.build"
 
 [project]
 name = "im-claude-channel"
-version = "0.1.0"
-description = "Telegram + Discord channel daemon for Claude Code — bridge IM messages to claude CLI sessions on remote servers, with auto-restart and stream-json progress."
+version = "0.2.0"
+description = "Telegram + Discord + Feishu channel daemon for Claude Code — bridges IM messages to claude CLI sessions, with auto-restart, stream-json progress, and slash-command support."
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
 authors = [
     { name = "ztllll", email = "11680661@qq.com" },
 ]
-keywords = ["telegram", "discord", "claude", "claude-code", "channel", "bot"]
+keywords = ["telegram", "discord", "feishu", "lark", "claude", "claude-code", "channel", "bot", "im"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "License :: OSI Approved :: Apache Software License",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
@@ -22,13 +22,20 @@ classifiers = [
     "Topic :: Communications :: Chat",
 ]
 
+# Core deps — telegram adapter is the v0.1 baseline so its driver is always
+# pulled in. The other adapters are optional extras; install whichever
+# platform(s) you intend to enable.
 dependencies = [
     "aiogram>=3.4",
     "PyYAML>=6.0",
+    "requests>=2.31",
 ]
 
 [project.optional-dependencies]
 discord = ["discord.py>=2.3"]
+feishu = ["lark-oapi>=1.4"]
+# Install everything at once.
+all = ["discord.py>=2.3", "lark-oapi>=1.4"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
