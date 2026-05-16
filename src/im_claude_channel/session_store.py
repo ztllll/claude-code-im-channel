@@ -3,6 +3,10 @@
 Composite primary key so the same chat_id (e.g. a numeric Telegram user that
 happens to collide with a Discord snowflake prefix) on different platforms
 maps to independent claude sessions.
+
+Also stores an optional human-readable ``label`` per chat (set via the
+``/rename <label>`` daemon command) so ``/sessions`` and ``/status`` can show
+"telegram会话" instead of just ``8570415194``.
 """
 
 from __future__ import annotations
@@ -20,6 +24,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     session_id TEXT NOT NULL,
     last_active_ts REAL NOT NULL,
     message_count INTEGER NOT NULL DEFAULT 0,
+    label TEXT,
     PRIMARY KEY (platform, chat_id)
 );
 """
@@ -35,6 +40,11 @@ class SessionStore:
         self._lock = threading.Lock()
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
+            # Forward-migrate older DBs that pre-date the label column.
+            # CREATE TABLE IF NOT EXISTS won't add the column to existing tables.
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(sessions)").fetchall()}
+            if "label" not in cols:
+                conn.execute("ALTER TABLE sessions ADD COLUMN label TEXT")
             conn.commit()
 
     @property
@@ -69,6 +79,7 @@ class SessionStore:
             conn.commit()
 
     def reset(self, platform: str, chat_id: str) -> None:
+        """Drop the session_id but keep the label (renaming survives /new)."""
         with self._lock, self._connect() as conn:
             conn.execute(
                 "DELETE FROM sessions WHERE platform = ? AND chat_id = ?",
@@ -76,11 +87,38 @@ class SessionStore:
             )
             conn.commit()
 
-    def list_all(self) -> list[tuple[str, str, str, float, int]]:
+    def set_label(self, platform: str, chat_id: str, label: str | None) -> None:
+        """Set/clear the human-readable label for a chat.
+
+        Creates a row with no session_id if the chat hasn't talked yet — that
+        way ``/rename`` can pre-label a chat before its first message.
+        """
+        now = time.time()
+        with self._lock, self._connect() as conn:
+            # UPSERT preserving session_id/message_count if a row exists.
+            conn.execute(
+                """
+                INSERT INTO sessions (platform, chat_id, session_id, last_active_ts, message_count, label)
+                VALUES (?, ?, '', ?, 0, ?)
+                ON CONFLICT(platform, chat_id) DO UPDATE SET label = excluded.label
+                """,
+                (platform, chat_id, now, label),
+            )
+            conn.commit()
+
+    def get_label(self, platform: str, chat_id: str) -> str | None:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT label FROM sessions WHERE platform = ? AND chat_id = ?",
+                (platform, chat_id),
+            ).fetchone()
+        return row[0] if row else None
+
+    def list_all(self) -> list[tuple[str, str, str, float, int, str | None]]:
         with self._lock, self._connect() as conn:
             return list(
                 conn.execute(
-                    "SELECT platform, chat_id, session_id, last_active_ts, message_count FROM sessions"
+                    "SELECT platform, chat_id, session_id, last_active_ts, message_count, label FROM sessions"
                 )
             )
 

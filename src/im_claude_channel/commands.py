@@ -91,6 +91,7 @@ MENU: list[tuple[str, str]] = [
     ("log", "显示 daemon 最近 30 行日志"),
     ("menu", "显示分组命令菜单（/help 的同义词）"),
     ("help", "列出可用命令"),
+    ("rename", "给当前 chat 起人类可读的标签（/rename 飞书会话；/rename 留空清除）"),
 
     # —— skill 透传（远程能用，会真的产生输出） ——
     ("review", "审查当前分支或 PR"),
@@ -156,7 +157,6 @@ MENU: list[tuple[str, str]] = [
 
     # —— 会话操作 ——
     ("export", "导出当前对话到文件或剪贴板"),
-    ("rename", "重命名当前对话"),
     ("resume", "[TUI] 旧会话恢复挑选器（注意：本菜单 /new 才是重置当前 chat）"),
     ("exit", "[TUI] 退出 CLI（在 daemon 里无意义）"),
 
@@ -173,7 +173,7 @@ MENU: list[tuple[str, str]] = [
 ]
 
 # Daemon intercepts these — everything else is forwarded to claude.
-_DAEMON_HANDLED = {"new", "cancel", "status", "sessions", "log", "help", "menu"}
+_DAEMON_HANDLED = {"new", "cancel", "status", "sessions", "log", "help", "menu", "rename"}
 
 
 # Curated grouped menu shown by /menu. Kept as a constant so we can iterate
@@ -312,8 +312,13 @@ def dispatch(
     daemon_started_at: float,
     cancel_registry: CancelRegistry | None = None,
     log_file: str | None = None,
+    args: str = "",
 ) -> CommandResult | None:
-    """Handle a daemon-side command. Returns None to fall through to claude."""
+    """Handle a daemon-side command. Returns None to fall through to claude.
+
+    ``args`` is the remainder of the message after the leading ``/cmd`` token
+    (already split by ``parse()``). Currently only ``/rename`` uses it.
+    """
 
     if name not in _DAEMON_HANDLED:
         return None
@@ -343,9 +348,11 @@ def dispatch(
         if not rows:
             return CommandResult(text="(空)")
         lines = ["*🗂 全部活动 session*", ""]
-        for plat, cid, sid, ts, n in sorted(rows):
+        for plat, cid, sid, ts, n, label in sorted(rows):
             marker = " ← 你" if (plat == platform and cid == chat_id) else ""
-            lines.append(f"`{plat}` / `{cid}` → `{sid[:8]}…` ({n} 条){marker}")
+            label_part = f" [{label}]" if label else ""
+            sid_part = f"`{sid[:8]}…`" if sid else "`(无 session)`"
+            lines.append(f"`{plat}` / `{cid}`{label_part} → {sid_part} ({n} 条){marker}")
         lines.append("")
         lines.append(f"共 {len(rows)} 个")
         return CommandResult(text="\n".join(lines))
@@ -369,12 +376,14 @@ def dispatch(
         my_row = next((r for r in rows if r[0] == platform and r[1] == chat_id), None)
         msg_count = my_row[4] if my_row else 0
         last_ts = my_row[3] if my_row else None
+        label = my_row[5] if my_row else None
+        label_part = f" [{label}]" if label else ""
 
         lines = [
             "*📊 daemon 状态*",
             f"daemon 已运行 `{_fmt_uptime(daemon_started_at)}`",
             "",
-            f"*本 chat (`{platform}` / `{chat_id}`)*",
+            f"*本 chat (`{platform}` / `{chat_id}`){label_part}*",
             f"session: `{sid or '(无 — 下条消息开新会话)'}`",
             f"已发消息数: {msg_count}",
         ]
@@ -399,5 +408,27 @@ def dispatch(
         # dump. The full 69-entry list is always available via Telegram's
         # native `/` autocomplete (we wrote it via setMyCommands).
         return CommandResult(text=_MENU_TEXT)
+
+    if name == "rename":
+        # /rename <label>   set the label for THIS chat
+        # /rename           clear it
+        # The label is stored daemon-side in SQLite (sessions.label), independent
+        # of claude's own session_id, so it survives /new and claude restarts.
+        # Intentionally intercepted: claude's TUI /rename doesn't work in -p
+        # mode (CLI returns a synthetic "isn't available" refusal), and the
+        # daemon-side label is what most users actually want anyway.
+        label = args.strip()
+        if not label:
+            prev = sessions.get_label(platform, chat_id)
+            sessions.set_label(platform, chat_id, None)
+            if prev:
+                return CommandResult(text=f"✅ 已清除标签（原标签：`{prev}`）。")
+            return CommandResult(text="ℹ️ 当前 chat 没有标签。用 `/rename 你的标签` 设置一个。")
+        if len(label) > 64:
+            return CommandResult(text="⚠️ 标签太长（最多 64 字符）。")
+        sessions.set_label(platform, chat_id, label)
+        return CommandResult(
+            text=f"✅ 本 chat 已命名为 `{label}`。/status 和 /sessions 都会显示这个标签。"
+        )
 
     return None

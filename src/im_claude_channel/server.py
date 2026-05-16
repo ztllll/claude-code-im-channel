@@ -519,7 +519,7 @@ class Daemon:
 
         parsed = parse_command(msg.text)
         if parsed is not None:
-            name, _args = parsed
+            name, args = parsed
             result = dispatch_command(
                 name,
                 sessions=self.sessions,
@@ -528,6 +528,7 @@ class Daemon:
                 daemon_started_at=self._started_at,
                 cancel_registry=self.cancels,
                 log_file=self.cfg.logging.file,
+                args=args,
             )
             if result is not None:
                 log.info("command: %s/%s ran /%s (daemon-handled)",
