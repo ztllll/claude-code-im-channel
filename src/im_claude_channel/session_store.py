@@ -36,6 +36,17 @@ CREATE TABLE IF NOT EXISTS sessions (
     context_window INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (platform, chat_id)
 );
+CREATE TABLE IF NOT EXISTS session_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    platform TEXT NOT NULL,
+    chat_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    label TEXT,
+    archived_at REAL NOT NULL,
+    message_count INTEGER NOT NULL DEFAULT 0,
+    cumulative_cost_usd REAL NOT NULL DEFAULT 0.0,
+    last_model TEXT
+);
 """
 
 # Columns added after v0.2.0. Each entry: (name, "TYPE [DEFAULT ...]") used
@@ -110,6 +121,135 @@ class SessionStore:
                 (platform, chat_id),
             )
             conn.commit()
+
+    def archive_to_history(self, platform: str, chat_id: str) -> bool:
+        """Copy current session row into session_history, then reset.
+
+        Returns True if a session was archived, False if there was nothing
+        to archive (no session_id set yet).
+        """
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """SELECT session_id, label, message_count, cumulative_cost_usd, last_model
+                   FROM sessions WHERE platform = ? AND chat_id = ?""",
+                (platform, chat_id),
+            ).fetchone()
+            if not row or not row[0]:
+                return False
+            session_id, label, msg_count, cost, model = row
+            conn.execute(
+                """INSERT INTO session_history
+                   (platform, chat_id, session_id, label, archived_at, message_count,
+                    cumulative_cost_usd, last_model)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (platform, chat_id, session_id, label, time.time(),
+                 msg_count, cost, model),
+            )
+            conn.execute(
+                "DELETE FROM sessions WHERE platform = ? AND chat_id = ?",
+                (platform, chat_id),
+            )
+            conn.commit()
+        return True
+
+    def list_history(self, platform: str, chat_id: str) -> list[dict]:
+        """Return archived sessions for this chat, newest first."""
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """SELECT id, session_id, label, archived_at, message_count,
+                          cumulative_cost_usd, last_model
+                   FROM session_history
+                   WHERE platform = ? AND chat_id = ?
+                   ORDER BY archived_at DESC""",
+                (platform, chat_id),
+            ).fetchall()
+        return [
+            {
+                "id": r[0], "session_id": r[1], "label": r[2],
+                "archived_at": r[3], "message_count": r[4],
+                "cumulative_cost_usd": float(r[5] or 0.0), "last_model": r[6],
+            }
+            for r in rows
+        ]
+
+    def restore_from_history(
+        self, platform: str, chat_id: str, query: str
+    ) -> dict | None:
+        """Swap the current active session for one from history.
+
+        ``query`` is matched against label (case-insensitive substring) or
+        session_id prefix. The current session (if any) is auto-archived first.
+        Returns the restored history row dict, or None if no match found.
+        """
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """SELECT id, session_id, label, archived_at, message_count,
+                          cumulative_cost_usd, last_model
+                   FROM session_history
+                   WHERE platform = ? AND chat_id = ?
+                   ORDER BY archived_at DESC""",
+                (platform, chat_id),
+            ).fetchall()
+
+        if not rows:
+            return None
+
+        q = query.strip().lower()
+        match = None
+        for r in rows:
+            sid, label = r[1], r[2] or ""
+            if q in label.lower() or sid.startswith(q) or str(r[0]) == q:
+                match = r
+                break
+        if match is None:
+            return None
+
+        history_id, session_id, label, archived_at, msg_count, cost, model = match
+
+        with self._lock, self._connect() as conn:
+            # Archive current active session (if any) before restoring.
+            cur = conn.execute(
+                """SELECT session_id, label, message_count, cumulative_cost_usd, last_model
+                   FROM sessions WHERE platform = ? AND chat_id = ?""",
+                (platform, chat_id),
+            ).fetchone()
+            if cur and cur[0]:
+                conn.execute(
+                    """INSERT INTO session_history
+                       (platform, chat_id, session_id, label, archived_at,
+                        message_count, cumulative_cost_usd, last_model)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (platform, chat_id, cur[0], cur[1], time.time(),
+                     cur[2], cur[3], cur[4]),
+                )
+
+            # Restore the chosen session as the active one.
+            conn.execute(
+                """INSERT INTO sessions (platform, chat_id, session_id, last_active_ts,
+                       message_count, label, cumulative_cost_usd, last_model)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(platform, chat_id) DO UPDATE SET
+                       session_id = excluded.session_id,
+                       last_active_ts = excluded.last_active_ts,
+                       message_count = excluded.message_count,
+                       label = excluded.label,
+                       cumulative_cost_usd = excluded.cumulative_cost_usd,
+                       last_model = excluded.last_model""",
+                (platform, chat_id, session_id, time.time(),
+                 msg_count, label, cost, model),
+            )
+
+            # Remove from history (it's now the active session).
+            conn.execute(
+                "DELETE FROM session_history WHERE id = ?", (history_id,)
+            )
+            conn.commit()
+
+        return {
+            "id": history_id, "session_id": session_id, "label": label,
+            "archived_at": archived_at, "message_count": msg_count,
+            "cumulative_cost_usd": float(cost or 0.0), "last_model": model,
+        }
 
     def swap_session(self, platform: str, chat_id: str, new_session_id: str) -> None:
         """Replace the session_id (used by /compact) without touching label or

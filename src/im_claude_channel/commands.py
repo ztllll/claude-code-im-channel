@@ -157,7 +157,7 @@ MENU: list[tuple[str, str]] = [
 
     # —— 会话操作 ——
     ("export", "导出当前对话到文件或剪贴板"),
-    ("resume", "[TUI] 旧会话恢复挑选器（注意：本菜单 /new 才是重置当前 chat）"),
+    ("resume", "恢复归档会话（/resume 查看列表；/resume 标签名 切换；配合 /rename + /new 使用）"),
     ("exit", "[TUI] 退出 CLI（在 daemon 里无意义）"),
 
     # —— 远程控制 / 调度 ——
@@ -173,7 +173,7 @@ MENU: list[tuple[str, str]] = [
 ]
 
 # Daemon intercepts these — everything else is forwarded to claude.
-_DAEMON_HANDLED = {"new", "cancel", "status", "sessions", "log", "help", "menu", "rename", "context", "model"}
+_DAEMON_HANDLED = {"new", "cancel", "status", "sessions", "log", "help", "menu", "rename", "context", "model", "resume"}
 
 
 # Curated grouped menu shown by /menu. Kept as a constant so we can iterate
@@ -181,7 +181,7 @@ _DAEMON_HANDLED = {"new", "cancel", "status", "sessions", "log", "help", "menu",
 _MENU_TEXT = """*🛠 命令菜单*
 
 *daemon 控制（秒回）*
-`/new` 开新对话 · `/cancel` 取消 turn · `/status` 状态 · `/sessions` 全部会话 · `/log` 日志尾 · `/help` 命令清单 · `/model` 切换模型
+`/new` 开新对话（归档旧会话）· `/resume` 恢复归档 · `/cancel` 取消 turn · `/status` 状态 · `/sessions` 全部会话 · `/log` 日志尾 · `/help` 命令清单 · `/model` 切换模型
 
 *🔍 代码审查（透传 claude）*
 `/review` 审分支 · `/security-review` 安全审查 · `/simplify` 代码质量 · `/ultrareview` 多 agent 云端审
@@ -325,11 +325,13 @@ def dispatch(
         return None
 
     if name == "new":
-        prev = sessions.get(platform, chat_id)
-        sessions.reset(platform, chat_id)
-        if prev:
+        label = sessions.get_label(platform, chat_id)
+        archived = sessions.archive_to_history(platform, chat_id)
+        if archived:
+            label_part = f" `{label}`" if label else ""
             return CommandResult(
-                text=f"✅ 已开新对话。上一段会话 `{prev}` 已断开，下一条消息会启动 fresh session。"
+                text=f"✅ 已开新对话。旧会话{label_part}已归档，用 `/resume {label or '标签/ID前缀'}` 可随时恢复。\n"
+                     "下一条消息会启动 fresh session。"
             )
         return CommandResult(text="✅ 当前 chat 没有活动会话，下一条消息直接启动 fresh session。")
 
@@ -346,16 +348,27 @@ def dispatch(
 
     if name == "sessions":
         rows = sessions.list_all()
-        if not rows:
-            return CommandResult(text="(空)")
+        history = sessions.list_history(platform, chat_id)
         lines = ["*🗂 全部活动 session*", ""]
-        for plat, cid, sid, ts, n, label in sorted(rows):
-            marker = " ← 你" if (plat == platform and cid == chat_id) else ""
-            label_part = f" [{label}]" if label else ""
-            sid_part = f"`{sid[:8]}…`" if sid else "`(无 session)`"
-            lines.append(f"`{plat}` / `{cid}`{label_part} → {sid_part} ({n} 条){marker}")
-        lines.append("")
-        lines.append(f"共 {len(rows)} 个")
+        if not rows:
+            lines.append("(暂无活动会话)")
+        else:
+            for plat, cid, sid, ts, n, label in sorted(rows):
+                marker = " ← 你" if (plat == platform and cid == chat_id) else ""
+                label_part = f" [{label}]" if label else ""
+                sid_part = f"`{sid[:8]}…`" if sid else "`(无 session)`"
+                lines.append(f"`{plat}` / `{cid}`{label_part} → {sid_part} ({n} 条){marker}")
+            lines.append(f"\n共 {len(rows)} 个活动")
+        if history:
+            lines += ["", "*📦 本 chat 历史归档（可 /resume 恢复）*", ""]
+            for h in history:
+                import datetime
+                dt = datetime.datetime.fromtimestamp(h["archived_at"]).strftime("%m-%d %H:%M")
+                lbl = f"`{h['label']}`" if h["label"] else "(无标签)"
+                lines.append(
+                    f"{lbl} — `{h['session_id'][:8]}…` {h['message_count']} 条  归档于 {dt}"
+                )
+            lines.append(f"\n共 {len(history)} 条归档")
         return CommandResult(text="\n".join(lines))
 
     if name == "log":
@@ -446,6 +459,39 @@ def dispatch(
                 f"*累计 (本 chat {u['message_count']} 轮)*\n"
                 f"总成本: `${u['cumulative_cost_usd']:.4f}`"
             )
+        )
+
+    if name == "resume":
+        history = sessions.list_history(platform, chat_id)
+        if not args.strip():
+            # No arg: show history list with hint
+            if not history:
+                return CommandResult(
+                    text="ℹ️ 本 chat 没有归档会话。\n"
+                         "先用 `/rename 任务名` 命名当前会话，再用 `/new` 开新对话，"
+                         "之后就可以用 `/resume 任务名` 回来。"
+                )
+            import datetime
+            lines = ["*📦 可恢复的归档会话*", "", "用 `/resume 标签名` 或 `/resume ID前缀` 恢复：", ""]
+            for h in history:
+                dt = datetime.datetime.fromtimestamp(h["archived_at"]).strftime("%m-%d %H:%M")
+                lbl = f"`{h['label']}`" if h["label"] else f"`{h['session_id'][:8]}…`"
+                lines.append(
+                    f"{lbl}  {h['message_count']} 条  归档于 {dt}  "
+                    f"${h['cumulative_cost_usd']:.4f}"
+                )
+            return CommandResult(text="\n".join(lines))
+
+        restored = sessions.restore_from_history(platform, chat_id, args.strip())
+        if restored is None:
+            return CommandResult(
+                text=f"⚠️ 找不到匹配 `{args.strip()}` 的归档会话。\n"
+                     "发 `/resume` 查看所有可恢复的会话。"
+            )
+        label_part = f"`{restored['label']}`" if restored["label"] else f"`{restored['session_id'][:8]}…`"
+        return CommandResult(
+            text=f"✅ 已恢复会话 {label_part}（{restored['message_count']} 条记录）。\n"
+                 "下一条消息会 resume 该 session 继续对话。"
         )
 
     if name == "model":
