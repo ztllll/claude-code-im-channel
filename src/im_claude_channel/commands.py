@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .quota import fetch_quota
 from .session_store import SessionStore
 
 
@@ -284,50 +285,87 @@ def _fmt_ts(ts: float) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
-def _fmt_rate_limit(info: dict | None, seen_at: float | None) -> list[str]:
-    """Format the Anthropic subscription rate-limit block for /status.
+_QUOTA_WINDOW_LABEL = {
+    "five_hour": "5 小时窗口",
+    "seven_day": "7 天窗口（总）",
+    "seven_day_sonnet": "7 天 Sonnet 子窗口",
+    "seven_day_opus": "7 天 Opus 子窗口",
+    "seven_day_oauth_apps": "7 天 OAuth Apps",
+}
 
-    ``info`` is the ``rate_limit_info`` payload from claude's
-    ``rate_limit_event`` (Pro/Max subscribers only). Empty / None means we
-    haven't seen one yet — either daemon just started, or the endpoint is
-    a sub2api/OneAPI relay that doesn't emit the event.
+
+def _parse_iso8601(s: str) -> float | None:
+    """Parse an ISO-8601 string ('2026-05-18T13:00:00.602651+00:00') to unix ts.
+
+    fromisoformat handles the +00:00 form in Python 3.11+; fractional seconds
+    are accepted. Returns None on malformed input rather than raising.
     """
-    if not info:
-        return [
-            "*🚦 Anthropic 配额*",
-            "(未知 — 还没收到 rate_limit_event；可能是中转端点或 daemon 刚启动)",
-        ]
+    if not isinstance(s, str) or not s:
+        return None
+    try:
+        return datetime.fromisoformat(s).timestamp()
+    except ValueError:
+        return None
+
+
+def _fmt_remaining(target_ts: float) -> str:
+    delta = int(target_ts - time.time())
+    if delta <= 0:
+        return "已过期（下次调用会刷新）"
+    if delta < 3600:
+        return f"{delta // 60}m{delta % 60}s"
+    if delta < 86400:
+        h, rem = divmod(delta, 3600)
+        return f"{h}h{rem // 60}m"
+    d, rem = divmod(delta, 86400)
+    h = rem // 3600
+    return f"{d}d{h}h"
+
+
+def _fmt_rate_limit(
+    payload: dict | None, fetched_at: float, last_error: str | None
+) -> list[str]:
+    """Format the rate-limit section from /api/oauth/usage payload.
+
+    Shows every non-null window so 5h + 7d + per-model 7d can all be visible
+    at once. Falls back to a clear "(中转/未授权)" line when the fetch fails.
+    """
     lines = ["*🚦 Anthropic 配额*"]
-    rl_type = info.get("rateLimitType") or "?"
-    status = info.get("status") or "?"
-    lines.append(f"当前窗口: `{rl_type}`  状态: `{status}`")
-    resets_at = info.get("resetsAt")
-    if resets_at:
-        remaining = int(resets_at) - int(time.time())
-        if remaining > 0:
-            h, m = divmod(remaining // 60, 60)
-            lines.append(f"窗口重置: 还剩 `{h}h{m}m` ({_fmt_ts(resets_at)})")
-        else:
-            lines.append(f"窗口已到期 ({_fmt_ts(resets_at)}) — 下次调用应该看到新窗口")
-    overage = info.get("overageStatus")
-    using_overage = info.get("isUsingOverage")
-    if overage:
-        overage_part = f"超额(overage): `{overage}`"
-        reason = info.get("overageDisabledReason")
-        if reason and overage == "rejected":
-            overage_part += f" ({reason})"
-        if using_overage:
-            overage_part += " — *当前正在使用超额*"
-        lines.append(overage_part)
-    if seen_at:
-        age = int(time.time() - seen_at)
-        if age < 60:
-            age_str = f"{age}s"
-        elif age < 3600:
-            age_str = f"{age // 60}m{age % 60}s"
-        else:
-            age_str = f"{age // 3600}h{(age % 3600) // 60}m"
-        lines.append(f"_数据来自 {age_str} 前最近一次 turn_")
+    if not payload:
+        reason = f" ({last_error})" if last_error else ""
+        lines.append(f"(无法读取 — 中转端点 / OAuth 未授权 / 网络问题{reason})")
+        return lines
+
+    for key, label in _QUOTA_WINDOW_LABEL.items():
+        win = payload.get(key)
+        if not isinstance(win, dict):
+            continue
+        util = win.get("utilization")
+        resets_at_str = win.get("resets_at")
+        if util is None and not resets_at_str:
+            continue
+        parts = [f"`{label}`"]
+        if isinstance(util, (int, float)):
+            parts.append(f"已用 *{util:.0f}%*")
+        if resets_at_str:
+            ts = _parse_iso8601(resets_at_str)
+            if ts is not None:
+                parts.append(f"还剩 `{_fmt_remaining(ts)}`")
+        lines.append("· " + "  ".join(parts))
+
+    extra = payload.get("extra_usage") or {}
+    if isinstance(extra, dict) and extra.get("is_enabled"):
+        used = extra.get("used_credits")
+        cap = extra.get("monthly_limit")
+        cur = extra.get("currency") or "USD"
+        if used is not None and cap is not None:
+            lines.append(f"· `额外用量(extra)`  已用 *{used}/{cap} {cur}*")
+    elif isinstance(extra, dict) and extra.get("disabled_reason"):
+        lines.append(f"_额外用量未启用 ({extra.get('disabled_reason')})_")
+
+    if fetched_at:
+        age = int(time.time() - fetched_at)
+        lines.append(f"_quota 数据 {age}s 前刷新_")
     return lines
 
 
@@ -361,8 +399,6 @@ def dispatch(
     log_file: str | None = None,
     args: str = "",
     global_model: str | None = None,
-    rate_limit_info: dict | None = None,
-    rate_limit_seen_at: float | None = None,
 ) -> CommandResult | None:
     """Handle a daemon-side command. Returns None to fall through to claude.
 
@@ -457,7 +493,8 @@ def dispatch(
         lines.append(f"全局会话总数: {len(rows)}")
 
         lines.append("")
-        lines.extend(_fmt_rate_limit(rate_limit_info, rate_limit_seen_at))
+        quota_payload, quota_fetched_at, quota_err = fetch_quota()
+        lines.extend(_fmt_rate_limit(quota_payload, quota_fetched_at, quota_err))
         return CommandResult(text="\n".join(lines))
 
     if name == "help":

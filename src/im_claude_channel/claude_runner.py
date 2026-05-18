@@ -36,6 +36,55 @@ from .config import ClaudeConfig
 log = logging.getLogger(__name__)
 
 
+_CLAUDE_PROJECTS_DIR = Path("~/.claude/projects").expanduser()
+
+
+def _find_session_file(session_id: str) -> Path | None:
+    """Locate a session's jsonl across all project dirs (project dir = cwd slug).
+
+    The daemon's ``work_dir`` determines the project slug, but to keep the
+    helper robust against config drift and old sessions migrated from other
+    cwds, we just scan ``~/.claude/projects/*/`` for the UUID. There are
+    typically only a handful of project dirs, so this is cheap.
+    """
+    if not session_id or not _CLAUDE_PROJECTS_DIR.is_dir():
+        return None
+    for proj in _CLAUDE_PROJECTS_DIR.iterdir():
+        if not proj.is_dir():
+            continue
+        f = proj / f"{session_id}.jsonl"
+        if f.is_file():
+            return f
+    return None
+
+
+def write_ai_title(session_id: str, title: str) -> bool:
+    """Append an ``ai-title`` event to the session jsonl so picker search finds it.
+
+    claude's ``--resume`` picker matches against the last ``ai-title.aiTitle``
+    event in the session file. AI-generated titles get appended automatically
+    as the conversation evolves; appending one of our own each turn ensures
+    the SQLite label is always the most recent entry the picker sees.
+    Idempotent enough: dup events in the same file are cheap (~100B) and
+    don't break anything.
+    """
+    if not session_id or not title:
+        return False
+    f = _find_session_file(session_id)
+    if f is None:
+        return False
+    event = {"type": "ai-title", "aiTitle": title, "sessionId": session_id}
+    try:
+        # POSIX O_APPEND writes < 4KB are atomic, so concurrent TUI / daemon
+        # appends don't tear lines. We're writing ~100B; safely under the cap.
+        with f.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+        return True
+    except OSError:
+        log.warning("write_ai_title: failed to append to %s", f, exc_info=True)
+        return False
+
+
 @dataclass
 class ClaudeResult:
     text: str
@@ -150,11 +199,12 @@ def run_stream(
     cmd.extend(cfg.extra_args)
     if resume_session_id:
         cmd.extend(["--resume", resume_session_id])
-    if session_label:
-        # Surface our SQLite label in claude's own session metadata so the
-        # TUI `--resume` picker shows it. Without this, daemon-spawned
-        # sessions appear as bare UUIDs.
-        cmd.extend(["--name", session_label])
+    # NOTE: we used to pass `--name <session_label>` here, but claude writes
+    # that to a `custom-title` event used only for the terminal window title
+    # — the `--resume` picker reads `ai-title.aiTitle` instead, and ignores
+    # custom-title for search. We now patch ai-title directly post-run via
+    # claude_runner.write_ai_title() called from the daemon.
+    _ = session_label  # kept for API compatibility; daemon writes ai-title
 
     work_dir = cfg.work_dir or None
     if work_dir:
