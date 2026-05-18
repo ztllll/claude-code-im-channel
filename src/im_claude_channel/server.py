@@ -34,6 +34,7 @@ import re
 import threading
 import time
 from collections import OrderedDict
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -194,6 +195,7 @@ def _process_message(
     adapter,               # Adapter
     loop: asyncio.AbstractEventLoop,
     cancels: CancelRegistry,
+    rate_limit_sink: Callable[[dict], None] | None = None,
 ) -> None:
     """Worker body — runs in a thread. Pushes UI updates back to the asyncio loop."""
 
@@ -352,9 +354,11 @@ def _process_message(
             runtime_claude_cfg = dataclasses.replace(
                 cfg.claude, extra_args=stripped + ["--model", model_override]
             )
+        chat_label = sessions.get_label(platform, chat_id)
         log.info(
-            "worker: claude run platform=%s chat=%s prompt-len=%d resume=%s model=%s",
+            "worker: claude run platform=%s chat=%s prompt-len=%d resume=%s model=%s label=%r",
             platform, chat_id, len(prompt), resume, model_override or "(global)",
+            chat_label,
         )
         result = claude_run_stream(
             full_prompt,
@@ -362,9 +366,15 @@ def _process_message(
             resume_session_id=resume,
             on_event=on_event,
             cancel_check=cancel_event.is_set,
+            session_label=chat_label,
         )
         if result.session_id:
             sessions.upsert(platform, chat_id, result.session_id)
+        if result.rate_limit_info and rate_limit_sink is not None:
+            try:
+                rate_limit_sink(result.rate_limit_info)
+            except Exception:  # noqa: BLE001
+                log.warning("worker: rate_limit_sink raised (non-fatal)", exc_info=True)
         # Snapshot per-turn token usage + accumulate cost so /context can
         # surface real numbers (claude's own /context only sees a fresh
         # session, not our resumed long-running one).
@@ -643,6 +653,21 @@ class Daemon:
         self._adapters: list = []
         self._started_at = time.monotonic()
         self.cancels = CancelRegistry()
+        # Most recent rate_limit_event from claude (Anthropic Pro/Max only;
+        # empty on sub2api/relay endpoints that don't emit the event).
+        # Updated under _rate_limit_lock by worker threads.
+        self._latest_rate_limit: dict | None = None
+        self._latest_rate_limit_seen_at: float | None = None
+        self._rate_limit_lock = threading.Lock()
+
+    def _record_rate_limit(self, info: dict) -> None:
+        with self._rate_limit_lock:
+            self._latest_rate_limit = info
+            self._latest_rate_limit_seen_at = time.time()
+
+    def _snapshot_rate_limit(self) -> tuple[dict | None, float | None]:
+        with self._rate_limit_lock:
+            return self._latest_rate_limit, self._latest_rate_limit_seen_at
 
     def _chat_lock(self, platform: str, chat_id: str) -> asyncio.Lock:
         key = (platform, chat_id)
@@ -771,6 +796,7 @@ class Daemon:
                 global_model: str | None = extra[extra.index("--model") + 1]
             except (ValueError, IndexError):
                 global_model = None
+            rl_info, rl_seen_at = self._snapshot_rate_limit()
             result = dispatch_command(
                 name,
                 sessions=self.sessions,
@@ -781,6 +807,8 @@ class Daemon:
                 log_file=self.cfg.logging.file,
                 args=args,
                 global_model=global_model,
+                rate_limit_info=rl_info,
+                rate_limit_seen_at=rl_seen_at,
             )
             if result is not None:
                 log.info("command: %s/%s ran /%s (daemon-handled)",
@@ -815,6 +843,7 @@ class Daemon:
                         adapter=adapter,
                         loop=loop,
                         cancels=self.cancels,
+                        rate_limit_sink=self._record_rate_limit,
                     ),
                 )
                 try:

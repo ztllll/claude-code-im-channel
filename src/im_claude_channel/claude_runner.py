@@ -42,6 +42,10 @@ class ClaudeResult:
     session_id: str | None
     is_error: bool
     raw: dict
+    # Last rate_limit_event seen during the turn (claude emits this once when
+    # the upstream API response carries Anthropic Max/Pro subscription window
+    # info). None on sub2api/relay endpoints that don't emit the event.
+    rate_limit_info: dict | None = None
 
 
 class ClaudeRunError(RuntimeError):
@@ -123,6 +127,7 @@ def run_stream(
     resume_session_id: str | None = None,
     on_event: Callable[[dict], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
+    session_label: str | None = None,
 ) -> ClaudeResult:
     """Run claude in stream-json mode and pipe events to ``on_event``.
 
@@ -145,6 +150,11 @@ def run_stream(
     cmd.extend(cfg.extra_args)
     if resume_session_id:
         cmd.extend(["--resume", resume_session_id])
+    if session_label:
+        # Surface our SQLite label in claude's own session metadata so the
+        # TUI `--resume` picker shows it. Without this, daemon-spawned
+        # sessions appear as bare UUIDs.
+        cmd.extend(["--name", session_label])
 
     work_dir = cfg.work_dir or None
     if work_dir:
@@ -182,6 +192,7 @@ def run_stream(
     final_event: dict | None = None
     last_session_id: str | None = None
     last_text: str = ""
+    last_rate_limit: dict | None = None
     # Accumulate every assistant text block seen during the turn — claude
     # may emit text *before* a tool_use (a quick "收到" / "let me check"
     # ack) and again *after* the tool_use comes back. The result event's
@@ -269,6 +280,11 @@ def run_stream(
             sid = ev.get("session_id")
             if sid:
                 last_session_id = sid
+
+            if ev.get("type") == "rate_limit_event":
+                info = ev.get("rate_limit_info")
+                if isinstance(info, dict):
+                    last_rate_limit = info
 
             # Capture each assistant text block as it streams — see the
             # all_text_blocks comment above for why we don't just use the
@@ -364,4 +380,5 @@ def run_stream(
         session_id=last_session_id,
         is_error=is_error,
         raw=final_event,
+        rate_limit_info=last_rate_limit,
     )

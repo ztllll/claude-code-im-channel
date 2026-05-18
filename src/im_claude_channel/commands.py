@@ -284,6 +284,53 @@ def _fmt_ts(ts: float) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
+def _fmt_rate_limit(info: dict | None, seen_at: float | None) -> list[str]:
+    """Format the Anthropic subscription rate-limit block for /status.
+
+    ``info`` is the ``rate_limit_info`` payload from claude's
+    ``rate_limit_event`` (Pro/Max subscribers only). Empty / None means we
+    haven't seen one yet — either daemon just started, or the endpoint is
+    a sub2api/OneAPI relay that doesn't emit the event.
+    """
+    if not info:
+        return [
+            "*🚦 Anthropic 配额*",
+            "(未知 — 还没收到 rate_limit_event；可能是中转端点或 daemon 刚启动)",
+        ]
+    lines = ["*🚦 Anthropic 配额*"]
+    rl_type = info.get("rateLimitType") or "?"
+    status = info.get("status") or "?"
+    lines.append(f"当前窗口: `{rl_type}`  状态: `{status}`")
+    resets_at = info.get("resetsAt")
+    if resets_at:
+        remaining = int(resets_at) - int(time.time())
+        if remaining > 0:
+            h, m = divmod(remaining // 60, 60)
+            lines.append(f"窗口重置: 还剩 `{h}h{m}m` ({_fmt_ts(resets_at)})")
+        else:
+            lines.append(f"窗口已到期 ({_fmt_ts(resets_at)}) — 下次调用应该看到新窗口")
+    overage = info.get("overageStatus")
+    using_overage = info.get("isUsingOverage")
+    if overage:
+        overage_part = f"超额(overage): `{overage}`"
+        reason = info.get("overageDisabledReason")
+        if reason and overage == "rejected":
+            overage_part += f" ({reason})"
+        if using_overage:
+            overage_part += " — *当前正在使用超额*"
+        lines.append(overage_part)
+    if seen_at:
+        age = int(time.time() - seen_at)
+        if age < 60:
+            age_str = f"{age}s"
+        elif age < 3600:
+            age_str = f"{age // 60}m{age % 60}s"
+        else:
+            age_str = f"{age // 3600}h{(age % 3600) // 60}m"
+        lines.append(f"_数据来自 {age_str} 前最近一次 turn_")
+    return lines
+
+
 def parse(text: str) -> tuple[str, str] | None:
     """Strip a leading ``/cmd`` (with optional ``@botname``) from message text.
 
@@ -314,6 +361,8 @@ def dispatch(
     log_file: str | None = None,
     args: str = "",
     global_model: str | None = None,
+    rate_limit_info: dict | None = None,
+    rate_limit_seen_at: float | None = None,
 ) -> CommandResult | None:
     """Handle a daemon-side command. Returns None to fall through to claude.
 
@@ -406,6 +455,9 @@ def dispatch(
 
         lines.append("")
         lines.append(f"全局会话总数: {len(rows)}")
+
+        lines.append("")
+        lines.extend(_fmt_rate_limit(rate_limit_info, rate_limit_seen_at))
         return CommandResult(text="\n".join(lines))
 
     if name == "help":
